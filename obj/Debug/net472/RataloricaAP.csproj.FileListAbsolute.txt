@@ -1,0 +1,9 @@
+C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.csproj.AssemblyReference.cache
+C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.AssemblyInfoInputs.cache
+C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.AssemblyInfo.cs
+C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.csproj.CoreCompileInputs.cache
+C:\Users\Enzob\Documents\RataloricaAP\bin\Debug\net472\RataloricaAP.dll
+C:\Users\Enzob\Documents\RataloricaAP\bin\Debug\net472\RataloricaAP.pdb
+C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.dll
+C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.pdb

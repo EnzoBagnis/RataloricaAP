@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "equyhTMCKYf3hOW7TxpI0/j5s6uME6vVZziljn8hdOScfHXBI7jzgBHD118EBe40jInAVQ1i8DwMleh+mpaOEA==",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Enzob\\Documents\\RataloricaAP\\RataloricaAP.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Enzob\\.nuget\\packages\\microsoft.netframework.referenceassemblies\\1.0.2\\microsoft.netframework.referenceassemblies.1.0.2.nupkg.sha512",
+    "C:\\Users\\Enzob\\.nuget\\packages\\microsoft.netframework.referenceassemblies.net472\\1.0.2\\microsoft.netframework.referenceassemblies.net472.1.0.2.nupkg.sha512"
+  ],
+  "logs": []
+}
