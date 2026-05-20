@@ -1,10 +1,13 @@
 using BepInEx;
+using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using UnityEngine;
@@ -18,119 +21,271 @@ namespace RataloricaAP
         public static RataloricaAPPlugin Instance;
         internal static ManualLogSource Log;
 
-        // AP Connection settings (modifiable via config)
+        // AP Connection settings
         private string apServer = "localhost:38281";
         private string apSlotName = "Player1";
         private string apPassword = "";
         private string apGame = "Ratalorica";
 
+        // Config entries
+        private ConfigEntry<string> cfgServer;
+        private ConfigEntry<string> cfgSlotName;
+        private ConfigEntry<string> cfgPassword;
+
+        // UI state
+        private bool showConnectionUI = true;
+        private string uiServer = "";
+        private string uiSlotName = "";
+        private string uiPassword = "";
+        internal string connectionStatus = "Disconnected";
+        private bool isConnecting = false;
+
         // AP state
         private ClientWebSocket ws;
-        private bool connected = false;
-        private bool authenticated = false;
+        internal bool connected = false;
+        internal bool authenticated = false;
         private long currentIndex = 0;
 
-        // Tracks which checks have been sent to avoid duplicates
         private HashSet<long> checkedLocations = new HashSet<long>();
-        // Tracks which items were received from AP
-        private HashSet<string> receivedUpgrades = new HashSet<string>();
+        // All location IDs in the current room (checked + missing)
+        private HashSet<long> roomLocationIds = new HashSet<long>();
+        // Track how many times each upgrade has been purchased (for multi-level checks)
+        internal Dictionary<string, int> upgradePurchaseCounts = new Dictionary<string, int>();
 
         // Base IDs matching the apworld
-        private const long LOCATION_BASE = 0xCA7A1000;
         private const long ITEM_BASE     = 0xCA7A0000;
+        private const long LOCATION_BASE = 0xCA7A1000;
+        private const int MAX_UPGRADE_LEVELS = 10;
 
-        // Location name -> AP ID
-        private static readonly Dictionary<string, long> LocationIDs = new Dictionary<string, long>
-        {
-            { "Buy first upgrade",            LOCATION_BASE + 0  },
-            { "Reach Shop Sign",              LOCATION_BASE + 1  },
-            { "Reach Upgrades Sign",          LOCATION_BASE + 2  },
-            { "SkillTree Floor2 Unlocked",    LOCATION_BASE + 3  },
-            { "SkillTree Floor3 Unlocked",    LOCATION_BASE + 4  },
-            { "Achievement - First Soul",     LOCATION_BASE + 5  },
-            { "Achievement - Uncommon Soul",  LOCATION_BASE + 6  },
-            { "Achievement - Rare Soul",      LOCATION_BASE + 7  },
-            { "Achievement - Legendary Soul", LOCATION_BASE + 8  },
-            { "World1 - Kill first enemy",    LOCATION_BASE + 9  },
-            { "World1 - Kill UNCOMMON enemy", LOCATION_BASE + 10 },
-            { "World1 - Kill RARE enemy",     LOCATION_BASE + 11 },
-            { "World1 - Collect 10 souls",    LOCATION_BASE + 12 },
-            { "World1 - Buy CmbtUp Floor1",   LOCATION_BASE + 13 },
-            { "World1 - Buy ExploUp Floor1",  LOCATION_BASE + 14 },
-            { "World2 - Kill first enemy",    LOCATION_BASE + 15 },
-            { "World2 - Kill RARE enemy",     LOCATION_BASE + 16 },
-            { "World2 - Kill LEGENDARY enemy",LOCATION_BASE + 17 },
-            { "World2 - Collect 50 souls",    LOCATION_BASE + 18 },
-            { "World2 - Buy CmbtUp Floor2",   LOCATION_BASE + 19 },
-            { "World2 - Buy ExploUp Floor2",  LOCATION_BASE + 20 },
-            { "World3 - Kill first enemy",    LOCATION_BASE + 21 },
-            { "World3 - Kill LEGENDARY enemy",LOCATION_BASE + 22 },
-            { "World3 - Collect 100 souls",   LOCATION_BASE + 23 },
-            { "World3 - Buy CmbtUp Floor3",   LOCATION_BASE + 24 },
-            { "World3 - Buy ShopUp Floor3",   LOCATION_BASE + 25 },
+        // ─── Item names (order must match apworld ALL_ITEM_NAMES) ───────────
+
+        private static readonly string[] ItemNames = {
+            "CmbtUp_AugmentRarityPoprate","CmbtUp_AugmentWalkingSpeed","CmbtUp_Plus1BigDamage",
+            "CmbtUp_Plus1MaxEnemies","CmbtUp_Plus1SmallDamage","CmbtUp_Plus1Stam",
+            "CmbtUp_ReduceSpawnCooldown","ExploUp_AdoptChick","ExploUp_AdoptRabbit",
+            "ExploUp_AugmentDoubleSouls","ExploUp_AugmentSpawnChance","ExploUp_AugmentStability",
+            "ShopUp_AttractMoreClients","ShopUp_AugmentRarityPrice","ShopUp_Charisma",
+            "ShopUp_Plus1NpcAtATime","ShopUp_Plus1Shout","ShopUp_Plus1Stam",
+            "ShopUp_Plus1Talk","Up_AutoInput",
+            "World1 Unlock","World2 Unlock","World3 Unlock",
+            "Gold Pouch","Soul Bundle",
         };
 
-        // AP item name -> upgrade classname in game
-        private static readonly Dictionary<string, string> ItemToUpgradeClass = new Dictionary<string, string>
-        {
-            { "CmbtUp_AugmentRarityPoprate",  "CmbtUp_AugmentRarityPoprate"  },
-            { "CmbtUp_AugmentWalkingSpeed",   "CmbtUp_AugmentWalkingSpeed"   },
-            { "CmbtUp_Plus1BigDamage",        "CmbtUp_Plus1BigDamage"        },
-            { "CmbtUp_Plus1MaxEnemies",       "CmbtUp_Plus1MaxEnemies"       },
-            { "CmbtUp_Plus1SmallDamage",      "CmbtUp_Plus1SmallDamage"      },
-            { "CmbtUp_Plus1Stam",             "CmbtUp_Plus1Stam"             },
-            { "CmbtUp_ReduceSpawnCooldown",   "CmbtUp_ReduceSpawnCooldown"   },
-            { "ExploUp_AdoptChick",           "ExploUp_AdoptChick"           },
-            { "ExploUp_AdoptRabbit",          "ExploUp_AdoptRabbit"          },
-            { "ExploUp_AugmentDoubleSouls",   "ExploUp_AugmentDoubleSouls"   },
-            { "ExploUp_AugmentSpawnChance",   "ExploUp_AugmentSpawnChance"   },
-            { "ExploUp_AugmentStability",     "ExploUp_AugmentStability"     },
-            { "ShopUp_AttractMoreClients",    "ShopUp_AttractMoreClients"    },
-            { "ShopUp_AugmentRarityPrice",    "ShopUp_AugmentRarityPrice"    },
-            { "ShopUp_Charisma",              "ShopUp_Charisma"              },
-            { "ShopUp_Plus1NpcAtATime",       "ShopUp_Plus1NpcAtATime"       },
-            { "ShopUp_Plus1Shout",            "ShopUp_Plus1Shout"            },
-            { "ShopUp_Plus1Stam",             "ShopUp_Plus1Stam"             },
-            { "ShopUp_Plus1Talk",             "ShopUp_Plus1Talk"             },
-            { "Up_AutoInput",                 "Up_AutoInput"                 },
+        // ─── Upgrade names (same order as apworld UPGRADE_ITEMS) ────────────
+
+        private static readonly string[] UpgradeNames = {
+            "CmbtUp_AugmentRarityPoprate","CmbtUp_AugmentWalkingSpeed","CmbtUp_Plus1BigDamage",
+            "CmbtUp_Plus1MaxEnemies","CmbtUp_Plus1SmallDamage","CmbtUp_Plus1Stam",
+            "CmbtUp_ReduceSpawnCooldown","ExploUp_AdoptChick","ExploUp_AdoptRabbit",
+            "ExploUp_AugmentDoubleSouls","ExploUp_AugmentSpawnChance","ExploUp_AugmentStability",
+            "ShopUp_AttractMoreClients","ShopUp_AugmentRarityPrice","ShopUp_Charisma",
+            "ShopUp_Plus1NpcAtATime","ShopUp_Plus1Shout","ShopUp_Plus1Stam",
+            "ShopUp_Plus1Talk","Up_AutoInput",
         };
+
+        // ─── Location IDs (matching apworld formula) ────────────────────────
+        // Event locations: LOCATION_BASE + index (0..18)
+        // Upgrade locations: LOCATION_BASE + 100 + (upgradeIndex * 10) + (level - 1)
+
+        internal static readonly Dictionary<string, long> LocationIDs = BuildLocationIDs();
+
+        private static string UpgradeLocName(string upgradeName, int level)
+        {
+            return level == 1 ? $"Buy {upgradeName}" : $"Buy {upgradeName} {level}";
+        }
+
+        private static Dictionary<string, long> BuildLocationIDs()
+        {
+            var dict = new Dictionary<string, long>();
+            // Event locations
+            string[] events = {
+                "Reach Shop Sign", "Reach Upgrades Sign",
+                "SkillTree Floor2 Unlocked", "SkillTree Floor3 Unlocked",
+                "Achievement - First Soul", "Achievement - Uncommon Soul",
+                "Achievement - Rare Soul", "Achievement - Legendary Soul",
+                "World1 - Kill first enemy", "World1 - Kill UNCOMMON enemy",
+                "World1 - Kill RARE enemy", "World1 - Collect 10 souls",
+                "World2 - Kill first enemy", "World2 - Kill RARE enemy",
+                "World2 - Kill LEGENDARY enemy", "World2 - Collect 50 souls",
+                "World3 - Kill first enemy", "World3 - Kill LEGENDARY enemy",
+                "World3 - Collect 100 souls",
+            };
+            for (int i = 0; i < events.Length; i++)
+                dict[events[i]] = LOCATION_BASE + i;
+            // Upgrade locations (all possible levels)
+            for (int ui = 0; ui < UpgradeNames.Length; ui++)
+            {
+                for (int lv = 0; lv < MAX_UPGRADE_LEVELS; lv++)
+                {
+                    string locName = UpgradeLocName(UpgradeNames[ui], lv + 1);
+                    dict[locName] = LOCATION_BASE + 100 + (ui * MAX_UPGRADE_LEVELS) + lv;
+                }
+            }
+            return dict;
+        }
 
         private void Awake()
         {
             Instance = this;
             Log = Logger;
 
-            // Load config
-            apServer   = Config.Bind("Connection", "Server",   "localhost:38281", "Archipelago server address").Value;
-            apSlotName = Config.Bind("Connection", "SlotName", "Player1",         "Your slot name").Value;
-            apPassword = Config.Bind("Connection", "Password", "",                "Server password (leave blank if none)").Value;
+            cfgServer   = Config.Bind("Connection", "Server",   "localhost:38281", "Archipelago server address");
+            cfgSlotName = Config.Bind("Connection", "SlotName", "Player1",         "Your slot name");
+            cfgPassword = Config.Bind("Connection", "Password", "",                "Server password (leave blank if none)");
+
+            uiServer   = cfgServer.Value;
+            uiSlotName = cfgSlotName.Value;
+            uiPassword = cfgPassword.Value;
 
             var harmony = new Harmony("com.ratalorica.archipelago");
             harmony.PatchAll();
 
-            Log.LogInfo("Ratalorica AP Plugin loaded. Connecting to " + apServer);
-            StartCoroutine(ConnectToAP());
+            var stateGo = new GameObject("APStateManager");
+            DontDestroyOnLoad(stateGo);
+            stateGo.AddComponent<APStateManager>();
+
+            Log.LogInfo("Ratalorica AP Plugin loaded. Waiting for connection...");
+        }
+
+        // ─── Input management ───────────────────────────────────────────────
+
+        private void Update()
+        {
+            if (Input.GetKeyDown(KeyCode.F1))
+                showConnectionUI = !showConnectionUI;
+
+            if (showConnectionUI)
+            {
+                Cursor.lockState = CursorLockMode.None;
+                Cursor.visible = true;
+            }
+        }
+
+        // ─── Connection UI (IMGUI) ─────────────────────────────────────────
+
+        private Rect windowRect;
+        private bool windowRectInitialized = false;
+
+        private void OnGUI()
+        {
+            if (showConnectionUI)
+            {
+                // Consume ALL input so game doesn't receive it
+                if (Event.current.type == EventType.KeyDown ||
+                    Event.current.type == EventType.KeyUp ||
+                    Event.current.type == EventType.MouseDown ||
+                    Event.current.type == EventType.MouseUp ||
+                    Event.current.type == EventType.ScrollWheel)
+                {
+                    // Let IMGUI handle it, don't propagate
+                }
+
+                if (!windowRectInitialized)
+                {
+                    float w = 380, h = 260;
+                    windowRect = new Rect((Screen.width - w) / 2f, (Screen.height - h) / 2f, w, h);
+                    windowRectInitialized = true;
+                }
+
+                GUI.depth = -1000;
+                windowRect = GUI.Window(98765, windowRect, DrawConnectionWindow, "Archipelago");
+
+                Cursor.lockState = CursorLockMode.None;
+                Cursor.visible = true;
+            }
+            else
+            {
+                DrawStatusBar();
+            }
+        }
+
+        private void DrawConnectionWindow(int windowID)
+        {
+            GUILayout.Space(5);
+            GUILayout.Label("Server:");
+            uiServer = GUILayout.TextField(uiServer);
+            GUILayout.Label("Slot Name:");
+            uiSlotName = GUILayout.TextField(uiSlotName);
+            GUILayout.Label("Password:");
+            uiPassword = GUILayout.PasswordField(uiPassword, '*');
+
+            GUILayout.Space(10);
+            GUI.enabled = !isConnecting && !authenticated;
+            if (GUILayout.Button(isConnecting ? "Connecting..." : "Connect"))
+                DoConnect();
+            GUI.enabled = true;
+
+            Color statusColor = authenticated ? Color.green : (isConnecting ? Color.yellow : Color.red);
+            GUILayout.Label(connectionStatus, new GUIStyle(GUI.skin.label) { normal = { textColor = statusColor } });
+
+            // Make window draggable
+            GUI.DragWindow();
+        }
+
+        private void DrawStatusBar()
+        {
+            Color c = authenticated ? Color.green : (connected ? Color.yellow : Color.red);
+            GUI.Label(new Rect(10, 10, 400, 25), "[AP] " + connectionStatus,
+                new GUIStyle(GUI.skin.label) { normal = { textColor = c }, fontSize = 14 });
+        }
+
+        private void DoConnect()
+        {
+            apServer   = uiServer.Trim();
+            apSlotName = uiSlotName.Trim();
+            apPassword = uiPassword;
+
+            cfgServer.Value   = apServer;
+            cfgSlotName.Value = apSlotName;
+            cfgPassword.Value = apPassword;
+
+            CheckAndResetForNewRun();
+            isConnecting = true;
+            connectionStatus = "Connecting...";
+            StartCoroutine(WebSocketConnect());
+        }
+
+        // ─── Save management ────────────────────────────────────────────────
+
+        private void CheckAndResetForNewRun()
+        {
+            string saveDir = Application.persistentDataPath;
+            string sessionPath = Path.Combine(saveDir, "ap_session.txt");
+            string savePath = Path.Combine(saveDir, "savedata");
+            string bakPath = Path.Combine(saveDir, "savedata.bak");
+            string backupPath = Path.Combine(saveDir, "savedata.ap_backup");
+
+            string currentSession = $"{apServer}|{apSlotName}";
+            string lastSession = File.Exists(sessionPath) ? File.ReadAllText(sessionPath).Trim() : null;
+
+            Log.LogInfo($"[AP] Current session: {currentSession}");
+            Log.LogInfo($"[AP] Last session: {lastSession ?? "(none)"}");
+
+            if (lastSession == currentSession)
+            {
+                Log.LogInfo("[AP] Same AP run — keeping save.");
+                return;
+            }
+
+            Log.LogInfo("[AP] New AP run detected! Resetting save...");
+            if (File.Exists(savePath))
+            {
+                File.Copy(savePath, backupPath, true);
+                File.Delete(savePath);
+                Log.LogInfo("[AP] Save file deleted (backup at savedata.ap_backup).");
+            }
+            if (File.Exists(bakPath))
+                File.Delete(bakPath);
+
+            File.WriteAllText(sessionPath, currentSession);
+            Log.LogInfo("[AP] Session info saved. Fresh run!");
         }
 
         // ─── WebSocket connection ───────────────────────────────────────────
 
-        private IEnumerator ConnectToAP()
-        {
-            while (true)
-            {
-                yield return new WaitForSeconds(3f);
-                if (!connected)
-                {
-                    Log.LogInfo("Trying to connect to AP server...");
-                    StartCoroutine(WebSocketLoop());
-                }
-            }
-        }
-
-        private IEnumerator WebSocketLoop()
+        private IEnumerator WebSocketConnect()
         {
             ws = new ClientWebSocket();
-            // archipelago.gg requires wss://, local servers use ws://
             string protocol = apServer.StartsWith("localhost") || apServer.StartsWith("127.0.0.1") ? "ws" : "wss";
             var uri = new Uri(protocol + "://" + apServer);
             var connectTask = ws.ConnectAsync(uri, CancellationToken.None);
@@ -139,10 +294,14 @@ namespace RataloricaAP
             if (ws.State != WebSocketState.Open)
             {
                 Log.LogWarning("Could not connect to AP server.");
+                connectionStatus = "Connection failed";
+                isConnecting = false;
                 yield break;
             }
 
             connected = true;
+            isConnecting = false;
+            connectionStatus = "Connected, authenticating...";
             Log.LogInfo("Connected to AP server!");
             StartCoroutine(ReceiveLoop());
         }
@@ -160,6 +319,7 @@ namespace RataloricaAP
                 {
                     connected = false;
                     authenticated = false;
+                    connectionStatus = "Disconnected";
                     Log.LogWarning("AP server disconnected.");
                     yield break;
                 }
@@ -180,17 +340,35 @@ namespace RataloricaAP
                     switch (cmd)
                     {
                         case "RoomInfo":
-                            SendConnect();
+                            SendConnectPacket();
                             break;
                         case "Connected":
                             authenticated = true;
+                            connectionStatus = $"Connected as {apSlotName}";
+                            showConnectionUI = false;
                             Log.LogInfo("Authenticated with AP server!");
-                            // Sync already-received items
+
+                            // Build the set of all location IDs in this room
+                            roomLocationIds.Clear();
                             if (packet.ContainsKey("checked_locations"))
                             {
                                 var locs = JsonConvert.DeserializeObject<List<long>>(packet["checked_locations"].ToString());
-                                foreach (var l in locs) checkedLocations.Add(l);
+                                foreach (var l in locs)
+                                {
+                                    checkedLocations.Add(l);
+                                    roomLocationIds.Add(l);
+                                }
+                                Log.LogInfo($"[AP] Already checked {locs.Count} locations:");
+                                foreach (var l in locs)
+                                    Log.LogInfo($"[AP]   - {GetLocationName(l) ?? "unknown"} (id={l})");
                             }
+                            if (packet.ContainsKey("missing_locations"))
+                            {
+                                var missing = JsonConvert.DeserializeObject<List<long>>(packet["missing_locations"].ToString());
+                                foreach (var l in missing) roomLocationIds.Add(l);
+                                Log.LogInfo($"[AP] Missing {missing.Count} locations. Total room locations: {roomLocationIds.Count}");
+                            }
+                            APStateManager.Instance?.RestoreFromCheckedLocations(checkedLocations);
                             break;
                         case "ReceivedItems":
                             HandleReceivedItems(packet);
@@ -208,12 +386,10 @@ namespace RataloricaAP
             }
         }
 
-        private void SendConnect()
+        private void SendConnectPacket()
         {
-            var connectPacket = new[]
-            {
-                new Dictionary<string, object>
-                {
+            SendPacket(new[] {
+                new Dictionary<string, object> {
                     { "cmd", "Connect" },
                     { "game", apGame },
                     { "name", apSlotName },
@@ -223,50 +399,50 @@ namespace RataloricaAP
                     { "tags", new string[0] },
                     { "uuid", Guid.NewGuid().ToString() },
                 }
-            };
-            SendPacket(connectPacket);
+            });
         }
 
         private void HandleReceivedItems(Dictionary<string, object> packet)
         {
             long index = Convert.ToInt64(packet["index"]);
             var items = JsonConvert.DeserializeObject<List<Dictionary<string, object>>>(packet["items"].ToString());
+            Log.LogInfo($"[AP] ReceivedItems: index={index}, count={items.Count}, currentIndex={currentIndex}");
 
             for (int i = 0; i < items.Count; i++)
             {
-                if (index + i <= currentIndex) continue;
+                if (index + i < currentIndex) continue;
                 currentIndex = index + i + 1;
 
                 long itemId = Convert.ToInt64(items[i]["item"]);
                 string itemName = GetItemName(itemId);
+                Log.LogInfo($"[AP] Item #{index + i}: {itemName ?? "unknown"} (id={itemId})");
                 if (itemName != null)
                     GrantItem(itemName);
             }
+            Log.LogInfo($"[AP] Done processing items. currentIndex={currentIndex}");
         }
 
         private string GetItemName(long id)
         {
             int idx = (int)(id - ITEM_BASE);
-            string[] names = {
-                "CmbtUp_AugmentRarityPoprate","CmbtUp_AugmentWalkingSpeed","CmbtUp_Plus1BigDamage",
-                "CmbtUp_Plus1MaxEnemies","CmbtUp_Plus1SmallDamage","CmbtUp_Plus1Stam",
-                "CmbtUp_ReduceSpawnCooldown","ExploUp_AdoptChick","ExploUp_AdoptRabbit",
-                "ExploUp_AugmentDoubleSouls","ExploUp_AugmentSpawnChance","ExploUp_AugmentStability",
-                "ShopUp_AttractMoreClients","ShopUp_AugmentRarityPrice","ShopUp_Charisma",
-                "ShopUp_Plus1NpcAtATime","ShopUp_Plus1Shout","ShopUp_Plus1Stam",
-                "ShopUp_Plus1Talk","Up_AutoInput",
-                "World1 Unlock","World2 Unlock","World3 Unlock",
-                "Gold Pouch","Soul Bundle"
-            };
-            if (idx >= 0 && idx < names.Length) return names[idx];
+            if (idx >= 0 && idx < ItemNames.Length) return ItemNames[idx];
             return null;
         }
 
-        // ─── Grant item to player ───────────────────────────────────────────
+        internal string GetLocationName(long id)
+        {
+            foreach (var kv in LocationIDs)
+            {
+                if (kv.Value == id) return kv.Key;
+            }
+            return null;
+        }
+
+        // ─── Grant item from AP ─────────────────────────────────────────────
 
         public void GrantItem(string itemName)
         {
-            Log.LogInfo($"[AP] Received item: {itemName}");
+            Log.LogInfo($"[AP] Granting item: {itemName}");
 
             if (itemName == "World1 Unlock" || itemName == "World2 Unlock" || itemName == "World3 Unlock")
             {
@@ -283,10 +459,8 @@ namespace RataloricaAP
                 APStateManager.Instance?.AddSouls(10);
                 return;
             }
-            if (ItemToUpgradeClass.ContainsKey(itemName))
-            {
-                APStateManager.Instance?.GrantUpgrade(ItemToUpgradeClass[itemName]);
-            }
+            // It's an upgrade — grant it via BuyUpgrade
+            APStateManager.Instance?.GrantUpgrade(itemName);
         }
 
         // ─── Send location check ────────────────────────────────────────────
@@ -301,30 +475,55 @@ namespace RataloricaAP
             checkedLocations.Add(id);
             Log.LogInfo($"[AP] Sending check: {locationName} ({id})");
 
-            var packet = new[]
-            {
-                new Dictionary<string, object>
-                {
+            SendPacket(new[] {
+                new Dictionary<string, object> {
                     { "cmd", "LocationChecks" },
                     { "locations", new long[] { id } }
                 }
-            };
-            SendPacket(packet);
+            });
+        }
+
+        public bool IsLocationChecked(string locationName)
+        {
+            if (!LocationIDs.ContainsKey(locationName)) return true;
+            return checkedLocations.Contains(LocationIDs[locationName]);
+        }
+
+        public bool IsLocationInRoom(string locationName)
+        {
+            if (!LocationIDs.ContainsKey(locationName)) return false;
+            return roomLocationIds.Contains(LocationIDs[locationName]);
+        }
+
+        /// <summary>
+        /// Get the next unchecked upgrade location for this upgrade type.
+        /// Returns null if no more checks available.
+        /// </summary>
+        public string GetNextUpgradeCheck(string upgradeClassName)
+        {
+            if (!upgradePurchaseCounts.ContainsKey(upgradeClassName))
+                upgradePurchaseCounts[upgradeClassName] = 0;
+
+            int nextLevel = upgradePurchaseCounts[upgradeClassName] + 1;
+            string locName = UpgradeLocName(upgradeClassName, nextLevel);
+
+            // Check if this location exists in the room and hasn't been checked yet
+            if (IsLocationInRoom(locName) && !IsLocationChecked(locName))
+                return locName;
+
+            return null;
         }
 
         public void SendGoal()
         {
             if (!authenticated) return;
             Log.LogInfo("[AP] Sending goal completion!");
-            var packet = new[]
-            {
-                new Dictionary<string, object>
-                {
+            SendPacket(new[] {
+                new Dictionary<string, object> {
                     { "cmd", "StatusUpdate" },
-                    { "status", 30 } // 30 = CLIENT_GOAL
+                    { "status", 30 }
                 }
-            };
-            SendPacket(packet);
+            });
         }
 
         private void SendPacket(object obj)
@@ -342,17 +541,20 @@ namespace RataloricaAP
     {
         public static APStateManager Instance;
 
-        // World unlocks received from AP
         public bool World1Unlocked = false;
         public bool World2Unlocked = false;
         public bool World3Unlocked = false;
 
-        // Pending upgrade grants (applied when save is loaded)
         public List<string> PendingUpgrades = new List<string>();
 
-        // Soul tracking for checks
+        // Flag: true when AP is granting an upgrade (allow BuyUpgrade to go through)
+        internal bool isGrantingUpgrade = false;
+
+        private HashSet<long> pendingCheckedLocations = null;
+        private bool objectivesRestored = false;
+
         private int totalSoulsTracked = 0;
-        private Dictionary<Enemy.RarityTypes, bool> firstKillSentPerWorld = new Dictionary<Enemy.RarityTypes, bool>();
+        private float retryTimer = 0f;
 
         private void Awake()
         {
@@ -361,6 +563,87 @@ namespace RataloricaAP
             DontDestroyOnLoad(gameObject);
         }
 
+        private void Update()
+        {
+            retryTimer += Time.deltaTime;
+            if (retryTimer < 2f) return;
+            retryTimer = 0f;
+
+            if (PendingUpgrades.Count > 0)
+                ApplyPendingUpgrades();
+
+            if (pendingCheckedLocations != null && !objectivesRestored)
+                TryRestoreObjectives();
+        }
+
+        // ─── Restore state from AP ─────────────────────────────────────────
+
+        public void RestoreFromCheckedLocations(HashSet<long> checkedLocations)
+        {
+            pendingCheckedLocations = checkedLocations;
+            objectivesRestored = false;
+            RataloricaAPPlugin.Log.LogInfo("[AP] Will restore game state from checked locations when ready...");
+            TryRestoreObjectives();
+        }
+
+        private bool HasCheck(string locationName)
+        {
+            if (pendingCheckedLocations == null) return false;
+            if (!RataloricaAPPlugin.LocationIDs.ContainsKey(locationName)) return false;
+            return pendingCheckedLocations.Contains(RataloricaAPPlugin.LocationIDs[locationName]);
+        }
+
+        private void TryRestoreObjectives()
+        {
+            var objMgr = FindObjectOfType<ObjectivesManager>();
+            if (objMgr == null)
+            {
+                RataloricaAPPlugin.Log.LogInfo("[AP] ObjectivesManager not ready yet, will retry...");
+                return;
+            }
+
+            var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+
+            if (HasCheck("Reach Shop Sign"))
+            {
+                var field = typeof(ObjectivesManager).GetField("isShopSignActivated", flags);
+                if (field != null)
+                {
+                    field.SetValue(objMgr, true);
+                    RataloricaAPPlugin.Log.LogInfo("[AP] Restored: Shop Sign activated");
+                }
+            }
+            if (HasCheck("Reach Upgrades Sign"))
+            {
+                var field = typeof(ObjectivesManager).GetField("isUpgradesSignActivated", flags);
+                if (field != null)
+                {
+                    field.SetValue(objMgr, true);
+                    RataloricaAPPlugin.Log.LogInfo("[AP] Restored: Upgrades Sign activated");
+                }
+            }
+
+            try
+            {
+                var nextObj = typeof(ObjectivesManager).GetMethod("NextObjective",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (nextObj != null)
+                {
+                    nextObj.Invoke(objMgr, null);
+                    RataloricaAPPlugin.Log.LogInfo("[AP] Called NextObjective to advance past completed objectives");
+                }
+            }
+            catch (Exception e)
+            {
+                RataloricaAPPlugin.Log.LogWarning("[AP] NextObjective call failed: " + e.Message);
+            }
+
+            objectivesRestored = true;
+            RataloricaAPPlugin.Log.LogInfo("[AP] Game state restored from AP checked locations!");
+        }
+
+        // ─── World unlocks ─────────────────────────────────────────────────
+
         public void UnlockWorld(string worldName)
         {
             if (worldName == "World1 Unlock") World1Unlocked = true;
@@ -368,6 +651,19 @@ namespace RataloricaAP
             if (worldName == "World3 Unlock") World3Unlocked = true;
             RataloricaAPPlugin.Log.LogInfo($"[AP] {worldName} unlocked!");
         }
+
+        public bool CanAccessWorld(WorldManager.World world)
+        {
+            switch (world)
+            {
+                case WorldManager.World.WORLD1: return World1Unlocked;
+                case WorldManager.World.WORLD2: return World1Unlocked && World2Unlocked;
+                case WorldManager.World.WORLD3: return World1Unlocked && World2Unlocked && World3Unlocked;
+                default: return true;
+            }
+        }
+
+        // ─── Money / Souls ──────────────────────────────────────────────────
 
         public void AddMoney(float amount)
         {
@@ -379,11 +675,11 @@ namespace RataloricaAP
 
         public void AddSouls(int amount)
         {
-            // SoulManager spawns souls via Unity prefabs — no direct add method.
-            // Soul Bundle gives 50 gold instead as filler reward.
             RataloricaAPPlugin.Log.LogInfo("[AP] Soul Bundle received — converting to 50 gold.");
             AddMoney(50f);
         }
+
+        // ─── Upgrade granting (from AP) ─────────────────────────────────────
 
         public void GrantUpgrade(string upgradeClassName)
         {
@@ -391,16 +687,60 @@ namespace RataloricaAP
             ApplyPendingUpgrades();
         }
 
-        public void ShowLockedMessage()
+        public void ApplyPendingUpgrades()
         {
-            // Simple on-screen message via Unity UI (no extra dependency needed)
-            RataloricaAPPlugin.Instance?.StartCoroutine(ShowMessageCoroutine("[Archipelago] Ce monde est verrouillé !"));
+            var upgrades = FindObjectsOfType<Upgrade>();
+            var toRemove = new List<string>();
+
+            isGrantingUpgrade = true;
+            foreach (var upName in PendingUpgrades)
+            {
+                foreach (var up in upgrades)
+                {
+                    if (up.GetType().Name == upName)
+                    {
+                        up.BuyUpgrade();
+                        toRemove.Add(upName);
+                        RataloricaAPPlugin.Log.LogInfo($"[AP] Applied upgrade: {upName}");
+                        break;
+                    }
+                }
+            }
+            isGrantingUpgrade = false;
+
+            foreach (var r in toRemove) PendingUpgrades.Remove(r);
         }
 
-        private System.Collections.IEnumerator ShowMessageCoroutine(string message)
+        // ─── Upgrade purchase (by player, effect blocked) ───────────────────
+
+        public void OnUpgradePurchased(Upgrade upgrade)
         {
-            // Create a temporary canvas text overlay
-            var go = new GameObject("AP_LockedMsg");
+            string typeName = upgrade.GetType().Name;
+            string locName = RataloricaAPPlugin.Instance.GetNextUpgradeCheck(typeName);
+
+            if (locName != null)
+            {
+                // Increment purchase count and send check
+                if (!RataloricaAPPlugin.Instance.upgradePurchaseCounts.ContainsKey(typeName))
+                    RataloricaAPPlugin.Instance.upgradePurchaseCounts[typeName] = 0;
+                RataloricaAPPlugin.Instance.upgradePurchaseCounts[typeName]++;
+
+                RataloricaAPPlugin.Instance.SendCheck(locName);
+                RataloricaAPPlugin.Log.LogInfo($"[AP] Upgrade purchase check sent: {locName}");
+            }
+        }
+
+        // ─── UI messages ────────────────────────────────────────────────────
+
+        public void ShowLockedMessage(string worldName)
+        {
+            RataloricaAPPlugin.Instance?.StartCoroutine(
+                ShowMessageCoroutine($"[Archipelago] {worldName} is locked!"));
+        }
+
+        private IEnumerator ShowMessageCoroutine(string message)
+        {
+            var go = new GameObject("AP_Msg");
             DontDestroyOnLoad(go);
             var canvas = go.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
@@ -425,32 +765,12 @@ namespace RataloricaAP
             Destroy(go);
         }
 
-        public void ApplyPendingUpgrades()
-        {
-            var upgrades = FindObjectsOfType<Upgrade>();
-            var toRemove = new List<string>();
-            foreach (var upName in PendingUpgrades)
-            {
-                foreach (var up in upgrades)
-                {
-                    if (up.GetType().Name == upName)
-                    {
-                        up.BuyUpgrade();
-                        toRemove.Add(upName);
-                        RataloricaAPPlugin.Log.LogInfo($"[AP] Applied upgrade: {upName}");
-                        break;
-                    }
-                }
-            }
-            foreach (var r in toRemove) PendingUpgrades.Remove(r);
-        }
+        // ─── Event handlers (called by patches) ────────────────────────────
 
-        // Called by patches when events happen
         public void OnEnemyKilled(Enemy enemy, WorldManager.World currentWorld)
         {
-            string worldPrefix = currentWorld.ToString(); // "WORLD1", "WORLD2", "WORLD3"
+            string worldPrefix = currentWorld.ToString();
 
-            // First kill in world
             string firstKillLoc = worldPrefix switch
             {
                 "WORLD1" => "World1 - Kill first enemy",
@@ -461,7 +781,6 @@ namespace RataloricaAP
             if (firstKillLoc != null)
                 RataloricaAPPlugin.Instance?.SendCheck(firstKillLoc);
 
-            // Rarity-based checks
             if (enemy.Rarity == Enemy.RarityTypes.UNCOMMON && worldPrefix == "WORLD1")
                 RataloricaAPPlugin.Instance?.SendCheck("World1 - Kill UNCOMMON enemy");
             if (enemy.Rarity == Enemy.RarityTypes.RARE)
@@ -476,14 +795,6 @@ namespace RataloricaAP
             }
         }
 
-        public void OnUpgradeBought(Upgrade upgrade)
-        {
-            // Generic upgrade check triggers
-            RataloricaAPPlugin.Instance?.SendCheck("Buy first upgrade");
-
-            // SkillTree floor checks are sent by the SkillTree patches
-        }
-
         public void OnSoulsUpdated(int total)
         {
             totalSoulsTracked = total;
@@ -495,6 +806,39 @@ namespace RataloricaAP
     }
 
     // ─── Harmony Patches ────────────────────────────────────────────────────
+
+    // CORE PATCH: Intercept upgrade purchases
+    // - If AP is granting → allow (effect applies)
+    // - If check available → block effect, send check, player still pays gold
+    // - If check already sent → allow normal purchase
+    [HarmonyPatch(typeof(Upgrade), "BuyUpgrade")]
+    public class UpgradeBuyPatch
+    {
+        static bool Prefix(Upgrade __instance)
+        {
+            try
+            {
+                if (APStateManager.Instance == null) return true;
+                if (APStateManager.Instance.isGrantingUpgrade) return true;
+                if (RataloricaAPPlugin.Instance == null) return true;
+
+                string typeName = __instance.GetType().Name;
+
+                // Check if there's a next upgrade check available
+                string nextCheck = RataloricaAPPlugin.Instance.GetNextUpgradeCheck(typeName);
+                if (nextCheck == null) return true; // No more checks → normal purchase
+
+                // Block the effect, send check
+                APStateManager.Instance.OnUpgradePurchased(__instance);
+                return false;
+            }
+            catch (Exception e)
+            {
+                RataloricaAPPlugin.Log.LogError("UpgradeBuyPatch error: " + e.Message);
+                return true;
+            }
+        }
+    }
 
     [HarmonyPatch(typeof(Enemy), "Kill")]
     public class EnemyKillPatch
@@ -513,43 +857,20 @@ namespace RataloricaAP
         }
     }
 
-    [HarmonyPatch(typeof(Upgrade), "BuyUpgrade")]
-    public class UpgradeBuyPatch
-    {
-        static void Postfix(Upgrade __instance)
-        {
-            try
-            {
-                APStateManager.Instance?.OnUpgradeBought(__instance);
-            }
-            catch (Exception e)
-            {
-                RataloricaAPPlugin.Log.LogError("UpgradeBuyPatch error: " + e.Message);
-            }
-        }
-    }
-
     [HarmonyPatch(typeof(WorldManager), "SwitchToWorld")]
     public class WorldSwitchPatch
     {
-        // Prefix: if the world is AP-locked, redirect to CLASSIC before the switch happens
         static void Prefix(ref WorldManager.World _worldToSwitchTo)
         {
             try
             {
                 if (APStateManager.Instance == null) return;
-
-                bool blocked = false;
-                if (_worldToSwitchTo == WorldManager.World.WORLD1 && !APStateManager.Instance.World1Unlocked) blocked = true;
-                if (_worldToSwitchTo == WorldManager.World.WORLD2 && !APStateManager.Instance.World2Unlocked) blocked = true;
-                if (_worldToSwitchTo == WorldManager.World.WORLD3 && !APStateManager.Instance.World3Unlocked) blocked = true;
-
-                if (blocked)
+                if (!APStateManager.Instance.CanAccessWorld(_worldToSwitchTo))
                 {
-                    RataloricaAPPlugin.Log.LogInfo($"[AP] {_worldToSwitchTo} is locked! Redirecting to CLASSIC.");
-                    // Redirect the argument — Harmony passes it by ref so this actually changes what the method receives
+                    string worldName = _worldToSwitchTo.ToString();
+                    RataloricaAPPlugin.Log.LogInfo($"[AP] {worldName} is locked! Redirecting to CLASSIC.");
                     _worldToSwitchTo = WorldManager.World.CLASSIC;
-                    APStateManager.Instance.ShowLockedMessage();
+                    APStateManager.Instance.ShowLockedMessage(worldName);
                 }
             }
             catch (Exception e)
@@ -566,12 +887,9 @@ namespace RataloricaAP
         {
             try
             {
-                // Check if shop/upgrades sign just got activated
-                // We read the private fields via reflection
-                var shopField = typeof(ObjectivesManager).GetField("isShopSignActivated",
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                var upField = typeof(ObjectivesManager).GetField("isUpgradesSignActivated",
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+                var shopField = typeof(ObjectivesManager).GetField("isShopSignActivated", flags);
+                var upField = typeof(ObjectivesManager).GetField("isUpgradesSignActivated", flags);
 
                 if (shopField != null && (bool)shopField.GetValue(__instance))
                     RataloricaAPPlugin.Instance?.SendCheck("Reach Shop Sign");
@@ -584,14 +902,67 @@ namespace RataloricaAP
             }
         }
     }
-}
 
-// ─── Soul Counter Patch ─────────────────────────────────────────────────────
-// PlayerManager.IncrementSoulCounter is private, so we patch it via EventBus.OnEnemyKilled
-// by hooking the same event. We read TotalSoulsCollected after kill.
+    // ─── SkillTree Floor Unlock Patches ─────────────────────────────────────
 
-namespace RataloricaAP
-{
+    [HarmonyPatch(typeof(SkillTree), "AddPointsToUnlockFloor2")]
+    public class SkillTreeFloor2Patch
+    {
+        static void Postfix(SkillTree __instance)
+        {
+            try
+            {
+                var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+                var field = typeof(SkillTree).GetField("floor2", flags);
+                if (field == null) return;
+
+                object floor2 = field.GetValue(__instance);
+                int pointsIn = (int)floor2.GetType().GetField("pointsIn").GetValue(floor2);
+                int needed = (int)floor2.GetType().GetField("pointsToUnlock").GetValue(floor2);
+
+                if (pointsIn >= needed)
+                {
+                    RataloricaAPPlugin.Log.LogInfo("[AP] SkillTree Floor2 unlocked!");
+                    RataloricaAPPlugin.Instance?.SendCheck("SkillTree Floor2 Unlocked");
+                }
+            }
+            catch (Exception e)
+            {
+                RataloricaAPPlugin.Log.LogError("SkillTreeFloor2Patch error: " + e.Message);
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(SkillTree), "AddPointsToUnlockFloor3")]
+    public class SkillTreeFloor3Patch
+    {
+        static void Postfix(SkillTree __instance)
+        {
+            try
+            {
+                var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+                var field = typeof(SkillTree).GetField("floor3", flags);
+                if (field == null) return;
+
+                object floor3 = field.GetValue(__instance);
+                int pointsIn = (int)floor3.GetType().GetField("pointsIn").GetValue(floor3);
+                int needed = (int)floor3.GetType().GetField("pointsToUnlock").GetValue(floor3);
+
+                if (pointsIn >= needed)
+                {
+                    RataloricaAPPlugin.Log.LogInfo("[AP] SkillTree Floor3 unlocked!");
+                    RataloricaAPPlugin.Instance?.SendCheck("SkillTree Floor3 Unlocked");
+                }
+            }
+            catch (Exception e)
+            {
+                RataloricaAPPlugin.Log.LogError("SkillTreeFloor3Patch error: " + e.Message);
+            }
+        }
+    }
+
+    // ─── Soul Counter Patch ─────────────────────────────────────────────────
+
     [HarmonyPatch(typeof(PlayerManager), "IncrementSoulCounter")]
     public class SoulCounterPatch
     {
@@ -602,7 +973,6 @@ namespace RataloricaAP
                 int total = __instance.TotalSoulsCollected;
                 APStateManager.Instance?.OnSoulsUpdated(total);
 
-                // Rarity achievement checks based on soulsCollected dict
                 var souls = __instance.SoulsCollected;
                 if (souls.ContainsKey(Enemy.RarityTypes.UNCOMMON) && souls[Enemy.RarityTypes.UNCOMMON] >= 1)
                     RataloricaAPPlugin.Instance?.SendCheck("Achievement - Uncommon Soul");
