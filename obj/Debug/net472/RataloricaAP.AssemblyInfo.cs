@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("RataloricaAP")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c5a76846c2f459b1718c6409c1f77c3ea1c0c93e")]
 [assembly: System.Reflection.AssemblyProductAttribute("RataloricaAP")]
 [assembly: System.Reflection.AssemblyTitleAttribute("RataloricaAP")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

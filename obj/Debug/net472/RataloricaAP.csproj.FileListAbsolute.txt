@@ -7,3 +7,4 @@ C:\Users\Enzob\Documents\RataloricaAP\bin\Debug\net472\RataloricaAP.dll
 C:\Users\Enzob\Documents\RataloricaAP\bin\Debug\net472\RataloricaAP.pdb
 C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.dll
 C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.pdb
+C:\Users\Enzob\Documents\RataloricaAP\obj\Debug\net472\RataloricaAP.sourcelink.json

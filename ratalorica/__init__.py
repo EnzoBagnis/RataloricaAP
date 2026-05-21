@@ -36,83 +36,128 @@ class RataloricaWeb(WebWorld):
     theme = "ocean"
     tutorials = []
 
-UPGRADE_ITEMS = [
-    "CmbtUp_AugmentRarityPoprate",
-    "CmbtUp_AugmentWalkingSpeed",
-    "CmbtUp_Plus1BigDamage",
-    "CmbtUp_Plus1MaxEnemies",
-    "CmbtUp_Plus1SmallDamage",
-    "CmbtUp_Plus1Stam",
-    "CmbtUp_ReduceSpawnCooldown",
-    "ExploUp_AdoptChick",
-    "ExploUp_AdoptRabbit",
-    "ExploUp_AugmentDoubleSouls",
-    "ExploUp_AugmentSpawnChance",
-    "ExploUp_AugmentStability",
-    "ShopUp_AttractMoreClients",
-    "ShopUp_AugmentRarityPrice",
-    "ShopUp_Charisma",
-    "ShopUp_Plus1NpcAtATime",
-    "ShopUp_Plus1Shout",
-    "ShopUp_Plus1Stam",
-    "ShopUp_Plus1Talk",
-    "Up_AutoInput",
+# ─── Display name → Game class name mapping ──────────────────────────────
+
+UPGRADE_MAP = {
+    "Rarity Pop Rate Up":   "CmbtUp_AugmentRarityPoprate",
+    "Walking Speed Up":     "CmbtUp_AugmentWalkingSpeed",
+    "Big Damage +1":        "CmbtUp_Plus1BigDamage",
+    "Max Enemies +1":       "CmbtUp_Plus1MaxEnemies",
+    "Small Damage +1":      "CmbtUp_Plus1SmallDamage",
+    "Combat Stamina +1":    "CmbtUp_Plus1Stam",
+    "Spawn Cooldown Down":  "CmbtUp_ReduceSpawnCooldown",
+    "Adopt Chick":          "ExploUp_AdoptChick",
+    "Adopt Rabbit":         "ExploUp_AdoptRabbit",
+    "Double Souls Up":      "ExploUp_AugmentDoubleSouls",
+    "Spawn Chance Up":      "ExploUp_AugmentSpawnChance",
+    "Stability Up":         "ExploUp_AugmentStability",
+    "Attract More Clients": "ShopUp_AttractMoreClients",
+    "Rarity Price Up":      "ShopUp_AugmentRarityPrice",
+    "Charisma Up":          "ShopUp_Charisma",
+    "NPC Capacity +1":      "ShopUp_Plus1NpcAtATime",
+    "Shout +1":             "ShopUp_Plus1Shout",
+    "Shop Stamina +1":      "ShopUp_Plus1Stam",
+    "Talk +1":              "ShopUp_Plus1Talk",
+    "Auto Input":           "Up_AutoInput",
+}
+
+UPGRADE_ITEMS = list(UPGRADE_MAP.keys())
+
+# ─── Floor assignments (sphere logic) ────────────────────────────────────
+# Adjust these lists to match the actual in-game skill tree layout.
+
+FLOOR1_UPGRADES = [
+    "Small Damage +1", "Combat Stamina +1", "Walking Speed Up",
+    "Talk +1", "Shout +1", "Shop Stamina +1", "Attract More Clients",
+]
+FLOOR2_UPGRADES = [
+    "Big Damage +1", "Max Enemies +1", "Spawn Cooldown Down",
+    "Rarity Pop Rate Up", "Charisma Up", "NPC Capacity +1", "Adopt Chick",
+]
+FLOOR3_UPGRADES = [
+    "Rarity Price Up", "Adopt Rabbit", "Double Souls Up",
+    "Spawn Chance Up", "Stability Up", "Auto Input",
 ]
 
-WORLD_UNLOCKS = ["World1 Unlock", "World2 Unlock", "World3 Unlock"]
-FILLER_ITEMS = ["Gold Pouch", "Soul Bundle"]
+WORLD_UNLOCKS = ["World 1 Unlock", "World 2 Unlock", "World 3 Unlock"]
+FILLER_ITEMS  = ["Gold Pouch", "Soul Bundle"]
 
 ALL_ITEM_NAMES = UPGRADE_ITEMS + WORLD_UNLOCKS + FILLER_ITEMS
 
-EVENT_LOCATIONS = [
+# ─── Kill milestones ─────────────────────────────────────────────────────
+
+KILL_MILESTONES = [
+    "Kill 10 Enemies",
+    "Kill 25 Enemies",
+    "Kill 50 Enemies",
+    "Kill 100 Enemies",
+    "Kill 200 Enemies",
+]
+
+# ─── Event locations ─────────────────────────────────────────────────────
+
+CLASSIC_EVENT_LOCATIONS = [
     "Reach Shop Sign",
     "Reach Upgrades Sign",
-    "SkillTree Floor2 Unlocked",
-    "SkillTree Floor3 Unlocked",
-    "Achievement - First Soul",
-    "Achievement - Uncommon Soul",
-    "Achievement - Rare Soul",
-    "Achievement - Legendary Soul",
-    "World1 - Kill first enemy",
-    "World1 - Kill UNCOMMON enemy",
-    "World1 - Kill RARE enemy",
-    "World1 - Collect 10 souls",
-    "World2 - Kill first enemy",
-    "World2 - Kill RARE enemy",
-    "World2 - Kill LEGENDARY enemy",
-    "World2 - Collect 50 souls",
-    "World3 - Kill first enemy",
-    "World3 - Kill LEGENDARY enemy",
-    "World3 - Collect 100 souls",
+    "SkillTree Floor 2 Unlocked",
+    "SkillTree Floor 3 Unlocked",
+    "First Soul Collected",
+    "Uncommon Soul Collected",
+    "Rare Soul Collected",
+    "Legendary Soul Collected",
 ]
+
+WORLD1_LOCATIONS = [
+    "World 1 - First Kill",
+    "World 1 - Kill Uncommon Enemy",
+    "World 1 - Kill Rare Enemy",
+    "World 1 - Collect 10 Souls",
+]
+WORLD2_LOCATIONS = [
+    "World 2 - First Kill",
+    "World 2 - Kill Rare Enemy",
+    "World 2 - Kill Legendary Enemy",
+    "World 2 - Collect 50 Souls",
+]
+WORLD3_LOCATIONS = [
+    "World 3 - First Kill",
+    "World 3 - Kill Legendary Enemy",
+    "World 3 - Collect 100 Souls",
+]
+
+EVENT_LOCATIONS = (
+    CLASSIC_EVENT_LOCATIONS
+    + WORLD1_LOCATIONS + WORLD2_LOCATIONS + WORLD3_LOCATIONS
+    + KILL_MILESTONES
+)
 
 MAX_UPGRADE_LEVELS = 10  # max supported by the option
 
+# ─── Item classifications ────────────────────────────────────────────────
+
 USEFUL_ITEMS = {
-    "CmbtUp_Plus1BigDamage", "CmbtUp_Plus1SmallDamage",
-    "ExploUp_AugmentDoubleSouls", "ExploUp_AugmentSpawnChance",
-    "ShopUp_Charisma", "Up_AutoInput",
-    "ExploUp_AdoptChick", "ExploUp_AdoptRabbit",
+    "Big Damage +1", "Small Damage +1",
+    "Double Souls Up", "Spawn Chance Up",
+    "Charisma Up", "Auto Input",
+    "Adopt Chick", "Adopt Rabbit",
 }
-PROGRESSION_ITEMS = {"World1 Unlock", "World2 Unlock", "World3 Unlock"}
+PROGRESSION_ITEMS = {"World 1 Unlock", "World 2 Unlock", "World 3 Unlock"}
 
 # ─── Location ID helpers ─────────────────────────────────────────────────
 
 LOCATION_BASE = RATA_BASE_ID + 0x1000
 
 def upgrade_loc_name(upgrade_name: str, level: int) -> str:
-    """Buy CmbtUp_X for level 1, Buy CmbtUp_X 2 for level 2, etc."""
+    """Buy Big Damage +1 for level 1, Buy Big Damage +1 Lv2 for level 2, etc."""
     if level == 1:
         return f"Buy {upgrade_name}"
-    return f"Buy {upgrade_name} {level}"
+    return f"Buy {upgrade_name} Lv{level}"
 
 def _build_all_location_ids() -> Dict[str, int]:
     """Pre-build IDs for ALL possible locations (event + upgrade up to max level)."""
-    ids = {}
-    # Event locations: indices 0..18
+    ids: Dict[str, int] = {}
     for i, name in enumerate(EVENT_LOCATIONS):
         ids[name] = LOCATION_BASE + i
-    # Upgrade locations: base 100, each upgrade gets a slot of MAX_UPGRADE_LEVELS
     for ui, up_name in enumerate(UPGRADE_ITEMS):
         for lv in range(MAX_UPGRADE_LEVELS):
             loc_name = upgrade_loc_name(up_name, lv + 1)
@@ -122,26 +167,6 @@ def _build_all_location_ids() -> Dict[str, int]:
 ALL_LOCATION_IDS = _build_all_location_ids()
 
 # ─── Region helpers ──────────────────────────────────────────────────────
-
-WORLD1_LOCATIONS = [
-    "World1 - Kill first enemy", "World1 - Kill UNCOMMON enemy",
-    "World1 - Kill RARE enemy", "World1 - Collect 10 souls",
-]
-WORLD2_LOCATIONS = [
-    "World2 - Kill first enemy", "World2 - Kill RARE enemy",
-    "World2 - Kill LEGENDARY enemy", "World2 - Collect 50 souls",
-]
-WORLD3_LOCATIONS = [
-    "World3 - Kill first enemy", "World3 - Kill LEGENDARY enemy",
-    "World3 - Collect 100 souls",
-]
-CLASSIC_EVENT_LOCATIONS = [
-    "Reach Shop Sign", "Reach Upgrades Sign",
-    "SkillTree Floor2 Unlocked", "SkillTree Floor3 Unlocked",
-    "Achievement - First Soul", "Achievement - Uncommon Soul",
-    "Achievement - Rare Soul", "Achievement - Legendary Soul",
-]
-
 
 class RataloricaWorld(World):
     """
@@ -155,17 +180,16 @@ class RataloricaWorld(World):
     options_dataclass = RataloricaOptions
     options: RataloricaOptions
 
-    # Register ALL possible IDs (AP requires this to be static)
     item_name_to_id: Dict[str, int] = {
         name: RATA_BASE_ID + i for i, name in enumerate(ALL_ITEM_NAMES)
     }
     location_name_to_id: Dict[str, int] = ALL_LOCATION_IDS
 
     item_name_groups = {
-        "Combat Upgrades": {n for n in UPGRADE_ITEMS if n.startswith("CmbtUp")},
-        "Exploration Upgrades": {n for n in UPGRADE_ITEMS if n.startswith("ExploUp")},
-        "Shop Upgrades": {n for n in UPGRADE_ITEMS if n.startswith("ShopUp")},
-        "World Unlocks": set(WORLD_UNLOCKS),
+        "Combat Upgrades":      {n for n in UPGRADE_ITEMS if UPGRADE_MAP[n].startswith("CmbtUp")},
+        "Exploration Upgrades": {n for n in UPGRADE_ITEMS if UPGRADE_MAP[n].startswith("ExploUp")},
+        "Shop Upgrades":        {n for n in UPGRADE_ITEMS if UPGRADE_MAP[n].startswith("ShopUp")},
+        "World Unlocks":        set(WORLD_UNLOCKS),
     }
 
     def create_item(self, name: str) -> RataloricaItem:
@@ -179,49 +203,87 @@ class RataloricaWorld(World):
 
     def create_regions(self) -> None:
         checks_per = self.options.checks_per_upgrade.value
+        p = self.player
 
-        menu    = Region("Menu",    self.player, self.multiworld)
-        classic = Region("Classic", self.player, self.multiworld)
-        world1  = Region("World1",  self.player, self.multiworld)
-        world2  = Region("World2",  self.player, self.multiworld)
-        world3  = Region("World3",  self.player, self.multiworld)
+        menu         = Region("Menu",           p, self.multiworld)
+        classic      = Region("Classic",        p, self.multiworld)
+        skill_floor2 = Region("Skill Floor 2",  p, self.multiworld)
+        skill_floor3 = Region("Skill Floor 3",  p, self.multiworld)
+        world1       = Region("World 1",        p, self.multiworld)
+        world2       = Region("World 2",        p, self.multiworld)
+        world3       = Region("World 3",        p, self.multiworld)
 
-        # Classic event locations
-        for name in CLASSIC_EVENT_LOCATIONS:
+        # ── Classic: events + kill milestones + floor-1 upgrades ──
+        for name in CLASSIC_EVENT_LOCATIONS + KILL_MILESTONES:
             classic.locations.append(
-                RataloricaLocation(self.player, name, self.location_name_to_id[name], classic)
-            )
+                RataloricaLocation(p, name, self.location_name_to_id[name], classic))
 
-        # Upgrade purchase locations (in Classic, number depends on option)
-        for up_name in UPGRADE_ITEMS:
+        for up_name in FLOOR1_UPGRADES:
             for lv in range(1, checks_per + 1):
                 loc_name = upgrade_loc_name(up_name, lv)
                 classic.locations.append(
-                    RataloricaLocation(self.player, loc_name, self.location_name_to_id[loc_name], classic)
-                )
+                    RataloricaLocation(p, loc_name, self.location_name_to_id[loc_name], classic))
 
-        # World locations
-        for region, locs in [(world1, WORLD1_LOCATIONS), (world2, WORLD2_LOCATIONS), (world3, WORLD3_LOCATIONS)]:
+        # ── Skill Floor 2: floor-2 upgrades ──
+        for up_name in FLOOR2_UPGRADES:
+            for lv in range(1, checks_per + 1):
+                loc_name = upgrade_loc_name(up_name, lv)
+                skill_floor2.locations.append(
+                    RataloricaLocation(p, loc_name, self.location_name_to_id[loc_name], skill_floor2))
+
+        # ── Skill Floor 3: floor-3 upgrades ──
+        for up_name in FLOOR3_UPGRADES:
+            for lv in range(1, checks_per + 1):
+                loc_name = upgrade_loc_name(up_name, lv)
+                skill_floor3.locations.append(
+                    RataloricaLocation(p, loc_name, self.location_name_to_id[loc_name], skill_floor3))
+
+        # ── World locations ──
+        for region, locs in [
+            (world1, WORLD1_LOCATIONS),
+            (world2, WORLD2_LOCATIONS),
+            (world3, WORLD3_LOCATIONS),
+        ]:
             for name in locs:
                 region.locations.append(
-                    RataloricaLocation(self.player, name, self.location_name_to_id[name], region)
-                )
+                    RataloricaLocation(p, name, self.location_name_to_id[name], region))
 
+        # ── Connections ──
         menu.connect(classic)
-        classic.connect(world1, rule=lambda state: state.has("World1 Unlock", self.player))
-        world1.connect(world2,  rule=lambda state: state.has("World2 Unlock", self.player))
-        world2.connect(world3,  rule=lambda state: state.has("World3 Unlock", self.player))
 
-        self.multiworld.regions += [menu, classic, world1, world2, world3]
+        # Floor 2 requires at least 3 floor-1 upgrade items received
+        classic.connect(skill_floor2, rule=lambda state, _p=p: (
+            sum(1 for up in FLOOR1_UPGRADES if state.has(up, _p)) >= 3
+        ))
+        # Floor 3 requires at least 3 floor-2 upgrade items received
+        skill_floor2.connect(skill_floor3, rule=lambda state, _p=p: (
+            sum(1 for up in FLOOR2_UPGRADES if state.has(up, _p)) >= 3
+        ))
+
+        classic.connect(world1, rule=lambda state, _p=p: state.has("World 1 Unlock", _p))
+        world1.connect(world2,  rule=lambda state, _p=p: state.has("World 2 Unlock", _p))
+        world2.connect(world3,  rule=lambda state, _p=p: state.has("World 3 Unlock", _p))
+
+        self.multiworld.regions += [
+            menu, classic, skill_floor2, skill_floor3, world1, world2, world3,
+        ]
 
     def create_items(self) -> None:
         checks_per = self.options.checks_per_upgrade.value
-        total_locations = len(CLASSIC_EVENT_LOCATIONS) + (len(UPGRADE_ITEMS) * checks_per) + \
-                          len(WORLD1_LOCATIONS) + len(WORLD2_LOCATIONS) + len(WORLD3_LOCATIONS)
+        total_locations = (
+            len(CLASSIC_EVENT_LOCATIONS)
+            + len(KILL_MILESTONES)
+            + len(FLOOR1_UPGRADES) * checks_per
+            + len(FLOOR2_UPGRADES) * checks_per
+            + len(FLOOR3_UPGRADES) * checks_per
+            + len(WORLD1_LOCATIONS)
+            + len(WORLD2_LOCATIONS)
+            + len(WORLD3_LOCATIONS)
+        )
 
-        pool = []
+        pool: List[str] = []
 
-        # Each upgrade appears checks_per times (one per level)
+        # Each upgrade appears checks_per times
         for name in UPGRADE_ITEMS:
             for _ in range(checks_per):
                 pool.append(name)
@@ -239,6 +301,13 @@ class RataloricaWorld(World):
             self.multiworld.itempool.append(self.create_item(name))
 
     def set_rules(self) -> None:
+        # Goal: all three world unlocks must be reachable.
+        # The in-game plugin additionally requires killing a legendary in World 3
+        # and collecting 100 souls, which are always achievable once worlds are open.
         self.multiworld.completion_condition[self.player] = (
-            lambda state: state.has("World3 Unlock", self.player)
+            lambda state, p=self.player: (
+                state.has("World 1 Unlock", p)
+                and state.has("World 2 Unlock", p)
+                and state.has("World 3 Unlock", p)
+            )
         )

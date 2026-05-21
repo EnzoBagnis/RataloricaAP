@@ -6,6 +6,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.WebSockets;
 using System.Threading.Tasks;
@@ -18,7 +19,7 @@ using Newtonsoft.Json;
 
 namespace RataloricaAP
 {
-    [BepInPlugin("com.ratalorica.archipelago", "Ratalorica Archipelago Client", "1.0.0")]
+    [BepInPlugin("com.ratalorica.archipelago", "Ratalorica Archipelago Client", "2.0.0")]
     public class RataloricaAPPlugin : BaseUnityPlugin
     {
         public static RataloricaAPPlugin Instance;
@@ -49,90 +50,142 @@ namespace RataloricaAP
         internal bool authenticated = false;
         private long currentIndex = 0;
 
-        // Set in CheckAndResetForNewRun, consumed after Connected packet
         private bool needsSceneReloadAfterConnect = false;
-        // Same session: save already has the items; don't re-apply the initial dump
         private bool skipInitialItemDump = false;
-        // Stable identifier for the AP room — captured from RoomInfo
         private string roomSeedName = null;
 
         private HashSet<long> checkedLocations = new HashSet<long>();
-        // All location IDs in the current room (checked + missing)
         private HashSet<long> roomLocationIds = new HashSet<long>();
-        // Track how many times each upgrade has been purchased (for multi-level checks)
         internal Dictionary<string, int> upgradePurchaseCounts = new Dictionary<string, int>();
+
+        // Player info from Connected packet
+        internal int mySlot = 0;
+        internal Dictionary<int, string> playerNames = new Dictionary<int, string>();
+
+        // Scout cache: location_id → (item_name, player_slot, flags)
+        internal Dictionary<long, ScoutInfo> scoutCache = new Dictionary<long, ScoutInfo>();
+
+        // AP logo texture (loaded from ap_logo.png in plugin folder)
+        internal Texture2D apLogoTexture;
 
         // Base IDs matching the apworld
         private const long ITEM_BASE     = 0xCA7A0000;
         private const long LOCATION_BASE = 0xCA7A1000;
         private const int MAX_UPGRADE_LEVELS = 10;
 
+        internal struct ScoutInfo
+        {
+            public string itemName;
+            public int player;
+            public int flags;
+        }
+
         // ─── Item names (order must match apworld ALL_ITEM_NAMES) ───────────
 
         private static readonly string[] ItemNames = {
-            "CmbtUp_AugmentRarityPoprate","CmbtUp_AugmentWalkingSpeed","CmbtUp_Plus1BigDamage",
-            "CmbtUp_Plus1MaxEnemies","CmbtUp_Plus1SmallDamage","CmbtUp_Plus1Stam",
-            "CmbtUp_ReduceSpawnCooldown","ExploUp_AdoptChick","ExploUp_AdoptRabbit",
-            "ExploUp_AugmentDoubleSouls","ExploUp_AugmentSpawnChance","ExploUp_AugmentStability",
-            "ShopUp_AttractMoreClients","ShopUp_AugmentRarityPrice","ShopUp_Charisma",
-            "ShopUp_Plus1NpcAtATime","ShopUp_Plus1Shout","ShopUp_Plus1Stam",
-            "ShopUp_Plus1Talk","Up_AutoInput",
-            "World1 Unlock","World2 Unlock","World3 Unlock",
+            "Rarity Pop Rate Up","Walking Speed Up","Big Damage +1",
+            "Max Enemies +1","Small Damage +1","Combat Stamina +1",
+            "Spawn Cooldown Down","Adopt Chick","Adopt Rabbit",
+            "Double Souls Up","Spawn Chance Up","Stability Up",
+            "Attract More Clients","Rarity Price Up","Charisma Up",
+            "NPC Capacity +1","Shout +1","Shop Stamina +1",
+            "Talk +1","Auto Input",
+            "World 1 Unlock","World 2 Unlock","World 3 Unlock",
             "Gold Pouch","Soul Bundle",
         };
 
-        // ─── Upgrade names (same order as apworld UPGRADE_ITEMS) ────────────
+        // ─── Display name ↔ Game class name mapping ─────────────────────────
 
-        private static readonly string[] UpgradeNames = {
-            "CmbtUp_AugmentRarityPoprate","CmbtUp_AugmentWalkingSpeed","CmbtUp_Plus1BigDamage",
-            "CmbtUp_Plus1MaxEnemies","CmbtUp_Plus1SmallDamage","CmbtUp_Plus1Stam",
-            "CmbtUp_ReduceSpawnCooldown","ExploUp_AdoptChick","ExploUp_AdoptRabbit",
-            "ExploUp_AugmentDoubleSouls","ExploUp_AugmentSpawnChance","ExploUp_AugmentStability",
-            "ShopUp_AttractMoreClients","ShopUp_AugmentRarityPrice","ShopUp_Charisma",
-            "ShopUp_Plus1NpcAtATime","ShopUp_Plus1Shout","ShopUp_Plus1Stam",
-            "ShopUp_Plus1Talk","Up_AutoInput",
+        internal static readonly Dictionary<string, string> DisplayToClassName = new Dictionary<string, string> {
+            {"Rarity Pop Rate Up",   "CmbtUp_AugmentRarityPoprate"},
+            {"Walking Speed Up",     "CmbtUp_AugmentWalkingSpeed"},
+            {"Big Damage +1",        "CmbtUp_Plus1BigDamage"},
+            {"Max Enemies +1",       "CmbtUp_Plus1MaxEnemies"},
+            {"Small Damage +1",      "CmbtUp_Plus1SmallDamage"},
+            {"Combat Stamina +1",    "CmbtUp_Plus1Stam"},
+            {"Spawn Cooldown Down",  "CmbtUp_ReduceSpawnCooldown"},
+            {"Adopt Chick",          "ExploUp_AdoptChick"},
+            {"Adopt Rabbit",         "ExploUp_AdoptRabbit"},
+            {"Double Souls Up",      "ExploUp_AugmentDoubleSouls"},
+            {"Spawn Chance Up",      "ExploUp_AugmentSpawnChance"},
+            {"Stability Up",         "ExploUp_AugmentStability"},
+            {"Attract More Clients", "ShopUp_AttractMoreClients"},
+            {"Rarity Price Up",      "ShopUp_AugmentRarityPrice"},
+            {"Charisma Up",          "ShopUp_Charisma"},
+            {"NPC Capacity +1",      "ShopUp_Plus1NpcAtATime"},
+            {"Shout +1",            "ShopUp_Plus1Shout"},
+            {"Shop Stamina +1",      "ShopUp_Plus1Stam"},
+            {"Talk +1",              "ShopUp_Plus1Talk"},
+            {"Auto Input",           "Up_AutoInput"},
+        };
+
+        internal static readonly Dictionary<string, string> ClassToDisplayName = BuildClassToDisplayName();
+
+        private static Dictionary<string, string> BuildClassToDisplayName()
+        {
+            var dict = new Dictionary<string, string>();
+            foreach (var kv in DisplayToClassName)
+                dict[kv.Value] = kv.Key;
+            return dict;
+        }
+
+        // Upgrade display names list (same order as apworld UPGRADE_ITEMS)
+        private static readonly string[] UpgradeDisplayNames = {
+            "Rarity Pop Rate Up","Walking Speed Up","Big Damage +1",
+            "Max Enemies +1","Small Damage +1","Combat Stamina +1",
+            "Spawn Cooldown Down","Adopt Chick","Adopt Rabbit",
+            "Double Souls Up","Spawn Chance Up","Stability Up",
+            "Attract More Clients","Rarity Price Up","Charisma Up",
+            "NPC Capacity +1","Shout +1","Shop Stamina +1",
+            "Talk +1","Auto Input",
         };
 
         // ─── Location IDs (matching apworld formula) ────────────────────────
-        // Event locations: LOCATION_BASE + index (0..18)
-        // Upgrade locations: LOCATION_BASE + 100 + (upgradeIndex * 10) + (level - 1)
 
         internal static readonly Dictionary<string, long> LocationIDs = BuildLocationIDs();
 
-        private static string UpgradeLocName(string upgradeName, int level)
+        private static string UpgradeLocName(string displayName, int level)
         {
-            return level == 1 ? $"Buy {upgradeName}" : $"Buy {upgradeName} {level}";
+            return level == 1 ? $"Buy {displayName}" : $"Buy {displayName} Lv{level}";
         }
 
         private static Dictionary<string, long> BuildLocationIDs()
         {
             var dict = new Dictionary<string, long>();
-            // Event locations
+            // Event locations (order must match apworld EVENT_LOCATIONS)
             string[] events = {
+                // Classic events
                 "Reach Shop Sign", "Reach Upgrades Sign",
-                "SkillTree Floor2 Unlocked", "SkillTree Floor3 Unlocked",
-                "Achievement - First Soul", "Achievement - Uncommon Soul",
-                "Achievement - Rare Soul", "Achievement - Legendary Soul",
-                "World1 - Kill first enemy", "World1 - Kill UNCOMMON enemy",
-                "World1 - Kill RARE enemy", "World1 - Collect 10 souls",
-                "World2 - Kill first enemy", "World2 - Kill RARE enemy",
-                "World2 - Kill LEGENDARY enemy", "World2 - Collect 50 souls",
-                "World3 - Kill first enemy", "World3 - Kill LEGENDARY enemy",
-                "World3 - Collect 100 souls",
+                "SkillTree Floor 2 Unlocked", "SkillTree Floor 3 Unlocked",
+                "First Soul Collected", "Uncommon Soul Collected",
+                "Rare Soul Collected", "Legendary Soul Collected",
+                // World locations
+                "World 1 - First Kill", "World 1 - Kill Uncommon Enemy",
+                "World 1 - Kill Rare Enemy", "World 1 - Collect 10 Souls",
+                "World 2 - First Kill", "World 2 - Kill Rare Enemy",
+                "World 2 - Kill Legendary Enemy", "World 2 - Collect 50 Souls",
+                "World 3 - First Kill", "World 3 - Kill Legendary Enemy",
+                "World 3 - Collect 100 Souls",
+                // Kill milestones
+                "Kill 10 Enemies", "Kill 25 Enemies", "Kill 50 Enemies",
+                "Kill 100 Enemies", "Kill 200 Enemies",
             };
             for (int i = 0; i < events.Length; i++)
                 dict[events[i]] = LOCATION_BASE + i;
+
             // Upgrade locations (all possible levels)
-            for (int ui = 0; ui < UpgradeNames.Length; ui++)
+            for (int ui = 0; ui < UpgradeDisplayNames.Length; ui++)
             {
                 for (int lv = 0; lv < MAX_UPGRADE_LEVELS; lv++)
                 {
-                    string locName = UpgradeLocName(UpgradeNames[ui], lv + 1);
+                    string locName = UpgradeLocName(UpgradeDisplayNames[ui], lv + 1);
                     dict[locName] = LOCATION_BASE + 100 + (ui * MAX_UPGRADE_LEVELS) + lv;
                 }
             }
             return dict;
         }
+
+        // ─── Lifecycle ──────────────────────────────────────────────────────
 
         private void Awake()
         {
@@ -154,7 +207,31 @@ namespace RataloricaAP
             DontDestroyOnLoad(stateGo);
             stateGo.AddComponent<APStateManager>();
 
-            Log.LogInfo("Ratalorica AP Plugin loaded. Waiting for connection...");
+            LoadAPLogo();
+
+            Log.LogInfo("Ratalorica AP Plugin v2.0 loaded. Waiting for connection...");
+        }
+
+        private void LoadAPLogo()
+        {
+            try
+            {
+                string pluginDir = Path.GetDirectoryName(typeof(RataloricaAPPlugin).Assembly.Location);
+                string logoPath = Path.Combine(pluginDir, "ap_logo.png");
+                if (File.Exists(logoPath))
+                {
+                    byte[] data = File.ReadAllBytes(logoPath);
+                    apLogoTexture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                    apLogoTexture.LoadImage(data);
+                    apLogoTexture.filterMode = FilterMode.Point;
+                    Log.LogInfo("[AP] Loaded AP logo from " + logoPath);
+                }
+                else
+                {
+                    Log.LogWarning("[AP] ap_logo.png not found at " + logoPath + " — place a pixel art AP logo there for upgrade previews.");
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[AP] Failed to load AP logo: " + e.Message); }
         }
 
         // ─── Input management ───────────────────────────────────────────────
@@ -176,7 +253,6 @@ namespace RataloricaAP
         private Rect windowRect;
         private bool windowRectInitialized = false;
 
-        // Used by the TransparentGame.Update patch to know whether to suppress click-through.
         public bool IsConnectionUIVisible => showConnectionUI;
         public Rect ConnectionWindowRect => windowRect;
 
@@ -184,16 +260,6 @@ namespace RataloricaAP
         {
             if (showConnectionUI)
             {
-                // Consume ALL input so game doesn't receive it
-                if (Event.current.type == EventType.KeyDown ||
-                    Event.current.type == EventType.KeyUp ||
-                    Event.current.type == EventType.MouseDown ||
-                    Event.current.type == EventType.MouseUp ||
-                    Event.current.type == EventType.ScrollWheel)
-                {
-                    // Let IMGUI handle it, don't propagate
-                }
-
                 if (!windowRectInitialized)
                 {
                     float w = 380, h = 260;
@@ -211,6 +277,10 @@ namespace RataloricaAP
             {
                 DrawStatusBar();
             }
+
+            // Always draw notifications (top-right)
+            if (APStateManager.Instance != null)
+                DrawNotifications();
         }
 
         private void DrawConnectionWindow(int windowID)
@@ -237,14 +307,11 @@ namespace RataloricaAP
             Color statusColor = authenticated ? Color.green : (isConnecting ? Color.yellow : Color.red);
             GUILayout.Label(connectionStatus, new GUIStyle(GUI.skin.label) { normal = { textColor = statusColor } });
 
-            // Drag only from the title bar so clicks inside the window don't trigger drags
-            // and don't leak through to the game underneath.
             GUI.DragWindow(new Rect(0, 0, 10000, 20));
         }
 
         private void DoDisconnect()
         {
-            // Save before tearing down so the stash on the next Connect reflects this run.
             try
             {
                 if (DataPersistenceManager.instance != null)
@@ -255,7 +322,6 @@ namespace RataloricaAP
             }
             catch (Exception e) { Log.LogWarning("[AP] SaveGame on disconnect failed: " + e.Message); }
 
-            // Persist currentIndex so we don't re-grant items on next connect to this session.
             PersistCurrentIndex();
 
             try
@@ -281,6 +347,42 @@ namespace RataloricaAP
                 new GUIStyle(GUI.skin.label) { normal = { textColor = c }, fontSize = 14 });
         }
 
+        // ─── Notification rendering ─────────────────────────────────────────
+
+        private void DrawNotifications()
+        {
+            var notifications = APStateManager.Instance.notifications;
+            float y = 40f;
+            for (int i = 0; i < notifications.Count; i++)
+            {
+                var n = notifications[i];
+                float alpha = Mathf.Clamp01(n.timer / 1.5f);
+                Color c = n.color;
+                c.a = alpha;
+                var style = new GUIStyle(GUI.skin.label)
+                {
+                    normal = { textColor = c },
+                    fontSize = 16,
+                    alignment = TextAnchor.MiddleRight,
+                    fontStyle = FontStyle.Bold,
+                };
+
+                // Draw shadow
+                Color shadow = Color.black;
+                shadow.a = alpha * 0.7f;
+                var shadowStyle = new GUIStyle(style) { normal = { textColor = shadow } };
+                GUI.Label(new Rect(Screen.width - 509, y + 1, 500, 28), n.text, shadowStyle);
+
+                // Draw text
+                GUI.Label(new Rect(Screen.width - 510, y, 500, 28), n.text, style);
+                y += 28;
+            }
+        }
+
+        // (Upgrade labels are handled via Unity UI in APStateManager.UpdateUpgradeLabels)
+
+        // ─── Connect ────────────────────────────────────────────────────────
+
         private void DoConnect()
         {
             apServer   = uiServer.Trim();
@@ -291,8 +393,6 @@ namespace RataloricaAP
             cfgSlotName.Value = apSlotName;
             cfgPassword.Value = apPassword;
 
-            // Save reset is deferred to after we have seed_name (RoomInfo) and a confirmed
-            // Connected response. Otherwise port changes would wipe the save spuriously.
             isConnecting = true;
             connectionStatus = "Connecting...";
             StartCoroutine(WebSocketConnect());
@@ -326,9 +426,6 @@ namespace RataloricaAP
             if (lastSession == currentSession)
             {
                 Log.LogInfo("[AP] Same AP run — keeping save.");
-                // If the plugin restarted since last play, currentIndex is back to 0 in memory
-                // but the save already has all those items applied. Restore the persisted
-                // index so HandleReceivedItems skips items <= currentIndex naturally.
                 if (currentIndex == 0 && File.Exists(currentIndexPath)
                     && long.TryParse(File.ReadAllText(currentIndexPath).Trim(), out long restoredIdx))
                 {
@@ -342,8 +439,6 @@ namespace RataloricaAP
 
             Log.LogInfo("[AP] Switching AP session — swapping per-session save files...");
 
-            // Force a save first so what we're about to stash is the live game state.
-            // The game only auto-saves every 60s, so without this we'd stash a stale file.
             try
             {
                 if (DataPersistenceManager.instance != null)
@@ -354,7 +449,6 @@ namespace RataloricaAP
             }
             catch (Exception e) { Log.LogWarning("[AP] SaveGame before swap failed: " + e.Message); }
 
-            // Persist the OLD session's currentIndex so we don't re-grant its items on return.
             if (!string.IsNullOrEmpty(lastSession))
             {
                 string oldIndexPath = Path.Combine(saveDir, $"ap_index_{SessionId(lastSession)}.txt");
@@ -366,8 +460,6 @@ namespace RataloricaAP
                 catch (Exception e) { Log.LogWarning("[AP] Persist index failed: " + e.Message); }
             }
 
-            // Backup the current save under the OLD session id, so we can restore it
-            // if the user comes back to that run later.
             if (File.Exists(savePath) && !string.IsNullOrEmpty(lastSession))
             {
                 string oldSessionSavePath = Path.Combine(saveDir, $"ap_save_{SessionId(lastSession)}.bak");
@@ -375,7 +467,6 @@ namespace RataloricaAP
                 Log.LogInfo($"[AP] Stashed old session save -> ap_save_{SessionId(lastSession)}.bak");
             }
 
-            // Restore the NEW session's save if we have one, otherwise start fresh.
             string newSessionSavePath = Path.Combine(saveDir, $"ap_save_{SessionId(currentSession)}.bak");
             if (File.Exists(newSessionSavePath))
             {
@@ -394,15 +485,13 @@ namespace RataloricaAP
 
             File.WriteAllText(sessionPath, currentSession);
 
-            // Reset runtime state so items re-apply cleanly to the swapped/fresh save
             checkedLocations.Clear();
             roomLocationIds.Clear();
             upgradePurchaseCounts.Clear();
+            scoutCache.Clear();
             currentIndex = 0;
             APStateManager.Instance?.ResetRuntimeState();
 
-            // Load the NEW session's persisted index if it has one (so we don't re-grant
-            // its already-applied items on return).
             if (File.Exists(currentIndexPath)
                 && long.TryParse(File.ReadAllText(currentIndexPath).Trim(), out long newIdx))
             {
@@ -434,11 +523,6 @@ namespace RataloricaAP
             var scene = SceneManager.GetActiveScene();
             SceneManager.LoadScene(scene.buildIndex);
 
-            // After reload, DataPersistenceManager.Start() runs OnSceneLoaded() which
-            // captures IDataPersistence objects available AT THAT MOMENT. Some Upgrades
-            // are instantiated later (e.g. when their menu becomes active), so we re-run
-            // OnSceneLoaded() after a short delay so their LoadData() is invoked and their
-            // currentLevel is properly restored from the swapped save.
             yield return new WaitForSeconds(2f);
             try
             {
@@ -455,13 +539,11 @@ namespace RataloricaAP
 
         private IEnumerator WebSocketConnect()
         {
-            // Force modern TLS — on some Windows / .NET 4.7.2 setups the default protocol
-            // is too old for archipelago.gg's certificate, causing a silent handshake failure.
             try
             {
                 ServicePointManager.SecurityProtocol =
                     SecurityProtocolType.Tls12 |
-                    (SecurityProtocolType)3072 /* Tls13 — value used so it compiles on older .NET targets */ |
+                    (SecurityProtocolType)3072 |
                     SecurityProtocolType.Tls11 |
                     SecurityProtocolType.Tls;
             }
@@ -517,7 +599,8 @@ namespace RataloricaAP
 
         private IEnumerator ReceiveLoop()
         {
-            var buffer = new byte[4096];
+            var buffer = new byte[16384];
+            var msgBuffer = new StringBuilder();
             while (ws != null && ws.State == WebSocketState.Open)
             {
                 var segment = new ArraySegment<byte>(buffer);
@@ -533,10 +616,16 @@ namespace RataloricaAP
                     yield break;
                 }
 
-                string msg = Encoding.UTF8.GetString(buffer, 0, receiveTask.Result.Count);
-                HandleMessage(msg);
+                msgBuffer.Append(Encoding.UTF8.GetString(buffer, 0, receiveTask.Result.Count));
+                if (receiveTask.Result.EndOfMessage)
+                {
+                    HandleMessage(msgBuffer.ToString());
+                    msgBuffer.Clear();
+                }
             }
         }
+
+        // ─── Message handling ───────────────────────────────────────────────
 
         private void HandleMessage(string raw)
         {
@@ -556,48 +645,19 @@ namespace RataloricaAP
                             }
                             SendConnectPacket();
                             break;
+
                         case "Connected":
-                            authenticated = true;
-                            connectionStatus = $"Connected as {apSlotName}";
-                            showConnectionUI = false;
-                            Log.LogInfo("Authenticated with AP server!");
-
-                            // Now that we have a confirmed identity (seed_name + slot), decide
-                            // whether to reset the save. Done here (not in DoConnect) so a
-                            // failed auth never wipes the save.
-                            CheckAndResetForNewRun();
-
-                            // Build the set of all location IDs in this room
-                            roomLocationIds.Clear();
-                            if (packet.ContainsKey("checked_locations"))
-                            {
-                                var locs = JsonConvert.DeserializeObject<List<long>>(packet["checked_locations"].ToString());
-                                foreach (var l in locs)
-                                {
-                                    checkedLocations.Add(l);
-                                    roomLocationIds.Add(l);
-                                }
-                                Log.LogInfo($"[AP] Already checked {locs.Count} locations:");
-                                foreach (var l in locs)
-                                    Log.LogInfo($"[AP]   - {GetLocationName(l) ?? "unknown"} (id={l})");
-                            }
-                            if (packet.ContainsKey("missing_locations"))
-                            {
-                                var missing = JsonConvert.DeserializeObject<List<long>>(packet["missing_locations"].ToString());
-                                foreach (var l in missing) roomLocationIds.Add(l);
-                                Log.LogInfo($"[AP] Missing {missing.Count} locations. Total room locations: {roomLocationIds.Count}");
-                            }
-                            APStateManager.Instance?.RestoreFromCheckedLocations(checkedLocations);
-
-                            if (needsSceneReloadAfterConnect)
-                            {
-                                needsSceneReloadAfterConnect = false;
-                                StartCoroutine(ReloadSceneCoroutine());
-                            }
+                            HandleConnected(packet);
                             break;
+
                         case "ReceivedItems":
                             HandleReceivedItems(packet);
                             break;
+
+                        case "LocationInfo":
+                            HandleLocationInfo(packet);
+                            break;
+
                         case "PrintJSON":
                             if (packet.ContainsKey("data"))
                                 Log.LogInfo("[AP] " + packet["data"]);
@@ -609,6 +669,187 @@ namespace RataloricaAP
             {
                 Log.LogError("AP message parse error: " + e.Message);
             }
+        }
+
+        private void HandleConnected(Dictionary<string, object> packet)
+        {
+            authenticated = true;
+            connectionStatus = $"Connected as {apSlotName}";
+            showConnectionUI = false;
+            Log.LogInfo("Authenticated with AP server!");
+
+            // Parse slot info
+            if (packet.ContainsKey("slot"))
+                mySlot = Convert.ToInt32(packet["slot"]);
+
+            // Parse player names
+            playerNames.Clear();
+            if (packet.ContainsKey("players"))
+            {
+                try
+                {
+                    var players = JsonConvert.DeserializeObject<List<Dictionary<string, object>>>(packet["players"].ToString());
+                    foreach (var p in players)
+                    {
+                        int slot = Convert.ToInt32(p["slot"]);
+                        string name = p.ContainsKey("alias") && p["alias"] != null && p["alias"].ToString() != ""
+                            ? p["alias"].ToString()
+                            : p["name"].ToString();
+                        playerNames[slot] = name;
+                    }
+                }
+                catch (Exception e) { Log.LogWarning("[AP] Failed to parse players: " + e.Message); }
+            }
+
+            CheckAndResetForNewRun();
+
+            // Build the set of all location IDs in this room
+            roomLocationIds.Clear();
+            if (packet.ContainsKey("checked_locations"))
+            {
+                var locs = JsonConvert.DeserializeObject<List<long>>(packet["checked_locations"].ToString());
+                foreach (var l in locs)
+                {
+                    checkedLocations.Add(l);
+                    roomLocationIds.Add(l);
+                }
+                Log.LogInfo($"[AP] Already checked {locs.Count} locations");
+            }
+            if (packet.ContainsKey("missing_locations"))
+            {
+                var missing = JsonConvert.DeserializeObject<List<long>>(packet["missing_locations"].ToString());
+                foreach (var l in missing) roomLocationIds.Add(l);
+                Log.LogInfo($"[AP] Missing {missing.Count} locations. Total room locations: {roomLocationIds.Count}");
+            }
+            APStateManager.Instance?.RestoreFromCheckedLocations(checkedLocations);
+
+            if (needsSceneReloadAfterConnect)
+            {
+                needsSceneReloadAfterConnect = false;
+                StartCoroutine(ReloadSceneCoroutine());
+            }
+
+            // Scout all unchecked upgrade locations for the hint system
+            SendScoutRequest();
+        }
+
+        private void HandleReceivedItems(Dictionary<string, object> packet)
+        {
+            long index = Convert.ToInt64(packet["index"]);
+            var items = JsonConvert.DeserializeObject<List<Dictionary<string, object>>>(packet["items"].ToString());
+            Log.LogInfo($"[AP] ReceivedItems: index={index}, count={items.Count}, currentIndex={currentIndex}");
+
+            if (skipInitialItemDump && index == 0)
+            {
+                skipInitialItemDump = false;
+                currentIndex = items.Count;
+                Log.LogInfo($"[AP] Same session — skipping {items.Count} initial items already applied in save. currentIndex={currentIndex}");
+                return;
+            }
+            skipInitialItemDump = false;
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                long itemId = Convert.ToInt64(items[i]["item"]);
+                string itemName = GetItemName(itemId);
+
+                bool isWorldUnlock = itemName == "World 1 Unlock"
+                                   || itemName == "World 2 Unlock"
+                                   || itemName == "World 3 Unlock";
+                bool alreadyApplied = index + i < currentIndex;
+
+                if (alreadyApplied && !isWorldUnlock) continue;
+                if (!alreadyApplied) currentIndex = index + i + 1;
+
+                Log.LogInfo($"[AP] Item #{index + i}: {itemName ?? "unknown"} (id={itemId})");
+                if (itemName != null)
+                {
+                    GrantItem(itemName);
+
+                    // Show notification for genuinely new items
+                    if (!alreadyApplied && APStateManager.Instance != null)
+                    {
+                        Color notifColor = Color.white;
+                        if (itemName.Contains("Unlock"))
+                            notifColor = new Color(0.6f, 0.4f, 1f); // purple for progression
+                        else if (itemName == "Gold Pouch" || itemName == "Soul Bundle")
+                            notifColor = new Color(1f, 0.85f, 0.2f); // gold for filler
+                        else
+                            notifColor = new Color(0.3f, 0.85f, 1f); // blue for upgrades
+
+                        APStateManager.Instance.AddNotification($"Received: {itemName}", notifColor);
+                    }
+                }
+            }
+            Log.LogInfo($"[AP] Done processing items. currentIndex={currentIndex}");
+            PersistCurrentIndex();
+        }
+
+        // ─── Scout system ───────────────────────────────────────────────────
+
+        private void SendScoutRequest()
+        {
+            var uncheckedUpgradeIds = new List<long>();
+            foreach (var kv in LocationIDs)
+            {
+                if (kv.Key.StartsWith("Buy ") && !checkedLocations.Contains(kv.Value) && roomLocationIds.Contains(kv.Value))
+                    uncheckedUpgradeIds.Add(kv.Value);
+            }
+            if (uncheckedUpgradeIds.Count == 0)
+            {
+                Log.LogInfo("[AP] No unchecked upgrade locations to scout.");
+                return;
+            }
+
+            Log.LogInfo($"[AP] Scouting {uncheckedUpgradeIds.Count} unchecked upgrade locations...");
+            SendPacket(new[] {
+                new Dictionary<string, object> {
+                    { "cmd", "LocationScouts" },
+                    { "locations", uncheckedUpgradeIds },
+                    { "create_as_hint", 2 }
+                }
+            });
+        }
+
+        private void HandleLocationInfo(Dictionary<string, object> packet)
+        {
+            if (!packet.ContainsKey("locations")) return;
+            try
+            {
+                var locations = JsonConvert.DeserializeObject<List<Dictionary<string, object>>>(packet["locations"].ToString());
+                foreach (var loc in locations)
+                {
+                    long locId = Convert.ToInt64(loc["location"]);
+                    long itemId = Convert.ToInt64(loc["item"]);
+                    int player = Convert.ToInt32(loc["player"]);
+                    int flags = Convert.ToInt32(loc["flags"]);
+
+                    // Try to resolve item name (only works for our game's items)
+                    string itemName = GetItemName(itemId) ?? "AP Item";
+
+                    scoutCache[locId] = new ScoutInfo { itemName = itemName, player = player, flags = flags };
+                }
+                Log.LogInfo($"[AP] Scouted {locations.Count} locations — press F2 to view");
+            }
+            catch (Exception e) { Log.LogWarning("[AP] Failed to parse LocationInfo: " + e.Message); }
+        }
+
+        // ─── Helpers ────────────────────────────────────────────────────────
+
+        private string GetItemName(long id)
+        {
+            int idx = (int)(id - ITEM_BASE);
+            if (idx >= 0 && idx < ItemNames.Length) return ItemNames[idx];
+            return null;
+        }
+
+        internal string GetLocationName(long id)
+        {
+            foreach (var kv in LocationIDs)
+            {
+                if (kv.Value == id) return kv.Key;
+            }
+            return null;
         }
 
         private void SendConnectPacket()
@@ -627,69 +868,13 @@ namespace RataloricaAP
             });
         }
 
-        private void HandleReceivedItems(Dictionary<string, object> packet)
-        {
-            long index = Convert.ToInt64(packet["index"]);
-            var items = JsonConvert.DeserializeObject<List<Dictionary<string, object>>>(packet["items"].ToString());
-            Log.LogInfo($"[AP] ReceivedItems: index={index}, count={items.Count}, currentIndex={currentIndex}");
-
-            // Same session reconnect — save already has these items; skip the initial dump
-            if (skipInitialItemDump && index == 0)
-            {
-                skipInitialItemDump = false;
-                currentIndex = items.Count;
-                Log.LogInfo($"[AP] Same session — skipping {items.Count} initial items already applied in save. currentIndex={currentIndex}");
-                return;
-            }
-            skipInitialItemDump = false;
-
-            for (int i = 0; i < items.Count; i++)
-            {
-                long itemId = Convert.ToInt64(items[i]["item"]);
-                string itemName = GetItemName(itemId);
-
-                // World unlocks live in memory only (APStateManager flags), not in the
-                // game's save. Re-apply them every reconnect so access state and goal
-                // status are correct, even when their original index was already skipped.
-                bool isWorldUnlock = itemName == "World1 Unlock"
-                                   || itemName == "World2 Unlock"
-                                   || itemName == "World3 Unlock";
-                bool alreadyApplied = index + i < currentIndex;
-
-                if (alreadyApplied && !isWorldUnlock) continue;
-                if (!alreadyApplied) currentIndex = index + i + 1;
-
-                Log.LogInfo($"[AP] Item #{index + i}: {itemName ?? "unknown"} (id={itemId})");
-                if (itemName != null)
-                    GrantItem(itemName);
-            }
-            Log.LogInfo($"[AP] Done processing items. currentIndex={currentIndex}");
-            PersistCurrentIndex();
-        }
-
-        private string GetItemName(long id)
-        {
-            int idx = (int)(id - ITEM_BASE);
-            if (idx >= 0 && idx < ItemNames.Length) return ItemNames[idx];
-            return null;
-        }
-
-        internal string GetLocationName(long id)
-        {
-            foreach (var kv in LocationIDs)
-            {
-                if (kv.Value == id) return kv.Key;
-            }
-            return null;
-        }
-
         // ─── Grant item from AP ─────────────────────────────────────────────
 
         public void GrantItem(string itemName)
         {
             Log.LogInfo($"[AP] Granting item: {itemName}");
 
-            if (itemName == "World1 Unlock" || itemName == "World2 Unlock" || itemName == "World3 Unlock")
+            if (itemName == "World 1 Unlock" || itemName == "World 2 Unlock" || itemName == "World 3 Unlock")
             {
                 APStateManager.Instance?.UnlockWorld(itemName);
                 return;
@@ -704,8 +889,9 @@ namespace RataloricaAP
                 APStateManager.Instance?.AddSouls(10);
                 return;
             }
-            // It's an upgrade — grant it via BuyUpgrade
-            APStateManager.Instance?.GrantUpgrade(itemName);
+            // It's an upgrade — map display name to class name
+            if (DisplayToClassName.ContainsKey(itemName))
+                APStateManager.Instance?.GrantUpgrade(DisplayToClassName[itemName]);
         }
 
         // ─── Send location check ────────────────────────────────────────────
@@ -719,6 +905,10 @@ namespace RataloricaAP
 
             checkedLocations.Add(id);
             Log.LogInfo($"[AP] Sending check: {locationName} ({id})");
+
+            // Show notification for checks sent
+            if (APStateManager.Instance != null)
+                APStateManager.Instance.AddNotification($"Check: {locationName}", new Color(0.2f, 1f, 0.2f));
 
             SendPacket(new[] {
                 new Dictionary<string, object> {
@@ -741,18 +931,16 @@ namespace RataloricaAP
         }
 
         /// <summary>
-        /// Get the next unchecked upgrade location for this upgrade type.
-        /// Returns null if no more checks available.
+        /// Get the next unchecked upgrade location for this upgrade (by display name).
         /// </summary>
-        public string GetNextUpgradeCheck(string upgradeClassName)
+        public string GetNextUpgradeCheck(string upgradeDisplayName)
         {
-            if (!upgradePurchaseCounts.ContainsKey(upgradeClassName))
-                upgradePurchaseCounts[upgradeClassName] = 0;
+            if (!upgradePurchaseCounts.ContainsKey(upgradeDisplayName))
+                upgradePurchaseCounts[upgradeDisplayName] = 0;
 
-            int nextLevel = upgradePurchaseCounts[upgradeClassName] + 1;
-            string locName = UpgradeLocName(upgradeClassName, nextLevel);
+            int nextLevel = upgradePurchaseCounts[upgradeDisplayName] + 1;
+            string locName = UpgradeLocName(upgradeDisplayName, nextLevel);
 
-            // Check if this location exists in the room and hasn't been checked yet
             if (IsLocationInRoom(locName) && !IsLocationChecked(locName))
                 return locName;
 
@@ -763,6 +951,8 @@ namespace RataloricaAP
         {
             if (!authenticated) return;
             Log.LogInfo("[AP] Sending goal completion!");
+            if (APStateManager.Instance != null)
+                APStateManager.Instance.AddNotification("GOAL COMPLETE!", new Color(1f, 0.84f, 0f));
             SendPacket(new[] {
                 new Dictionary<string, object> {
                     { "cmd", "StatusUpdate" },
@@ -791,18 +981,47 @@ namespace RataloricaAP
         public bool World3Unlocked = false;
 
         public List<string> PendingUpgrades = new List<string>();
-        // Money received from AP that couldn't be applied yet (PlayerManager missing or
-        // about to be destroyed by a scene reload). Drained once PlayerManager is alive.
         public float PendingMoney = 0f;
 
-        // Flag: true when AP is granting an upgrade (allow BuyUpgrade to go through)
         internal bool isGrantingUpgrade = false;
 
         private HashSet<long> pendingCheckedLocations = null;
         private bool objectivesRestored = false;
 
         private int totalSoulsTracked = 0;
+        private int totalKillsTracked = 0;
         private float retryTimer = 0f;
+
+        // Track which upgrades are currently known to be active (for unlock detection)
+        private HashSet<string> knownActiveUpgrades = new HashSet<string>();
+
+        // Cached Upgrade references for hover tooltip (refreshed every 2s)
+        internal Upgrade[] cachedUpgrades;
+
+        // Hover tooltip: override the game's description text when hovering an AP upgrade
+        private TMPro.TextMeshProUGUI _descriptionText;
+        private string _originalDescription;
+        private bool _isShowingAPDesc = false;
+        private Upgrade _lastHoveredUpgrade;
+        private bool _descriptionSearchDone = false;
+
+        // ─── Notifications ──────────────────────────────────────────────────
+
+        internal struct ItemNotification
+        {
+            public string text;
+            public Color color;
+            public float timer;
+        }
+        internal List<ItemNotification> notifications = new List<ItemNotification>();
+
+        public void AddNotification(string text, Color color)
+        {
+            notifications.Insert(0, new ItemNotification { text = text, color = color, timer = 5f });
+            if (notifications.Count > 12) notifications.RemoveAt(notifications.Count - 1);
+        }
+
+        // ─── Lifecycle ──────────────────────────────────────────────────────
 
         private void Awake()
         {
@@ -821,6 +1040,15 @@ namespace RataloricaAP
             pendingCheckedLocations = null;
             objectivesRestored = false;
             totalSoulsTracked = 0;
+            totalKillsTracked = 0;
+            knownActiveUpgrades.Clear();
+            cachedUpgrades = null;
+            _descriptionText = null;
+            _originalDescription = null;
+            _isShowingAPDesc = false;
+            _lastHoveredUpgrade = null;
+            _descriptionSearchDone = false;
+            notifications.Clear();
         }
 
         public void MarkObjectivesNotYetRestored()
@@ -830,9 +1058,24 @@ namespace RataloricaAP
 
         private void Update()
         {
+            // Update notification timers
+            for (int i = notifications.Count - 1; i >= 0; i--)
+            {
+                var n = notifications[i];
+                n.timer -= Time.deltaTime;
+                notifications[i] = n;
+                if (n.timer <= 0) notifications.RemoveAt(i);
+            }
+
+            // Hover tooltip runs every frame for responsiveness
+            UpdateHoverTooltip();
+
             retryTimer += Time.deltaTime;
             if (retryTimer < 2f) return;
             retryTimer = 0f;
+
+            // Refresh cached upgrade list for hover tooltip
+            cachedUpgrades = FindObjectsOfType<Upgrade>();
 
             if (PendingUpgrades.Count > 0)
                 ApplyPendingUpgrades();
@@ -847,6 +1090,395 @@ namespace RataloricaAP
 
             if (pendingCheckedLocations != null && !objectivesRestored)
                 TryRestoreObjectives();
+
+            // Scan for newly available upgrades (upgrade unlock checks)
+            ScanForNewUpgrades();
+
+            // Update AP item labels on upgrade icons
+            UpdateUpgradeLabels();
+        }
+
+        // ─── Hover tooltip: show AP item in the game's description zone ────
+
+        private void FindDescriptionText()
+        {
+            if (_descriptionSearchDone) return;
+            _descriptionSearchDone = true;
+
+            // Search all TMPro texts for one that looks like the upgrade description zone
+            var allTmp = FindObjectsOfType<TMPro.TextMeshProUGUI>(true);
+            TMPro.TextMeshProUGUI bestCandidate = null;
+            float bestWidth = 0;
+
+            foreach (var tmp in allTmp)
+            {
+                if (tmp == null) continue;
+                // Skip our own labels
+                if (tmp.gameObject.name.StartsWith("AP_")) continue;
+
+                // Build hierarchy path
+                string path = "";
+                var t = tmp.transform;
+                while (t != null) { path = t.gameObject.name + "/" + path; t = t.parent; }
+
+                // Log all TMPro for debugging (first time only)
+                RataloricaAPPlugin.Log.LogInfo($"[AP][Desc] TMPro: path={path} text='{tmp.text?.Substring(0, Math.Min(tmp.text?.Length ?? 0, 60))}' w={tmp.rectTransform.rect.width:F0}");
+
+                // Look for description text: should be in the upgrade screen area, not inside a Floor/upgrade icon
+                bool inUpgradeScreen = path.Contains("Upgrade") || path.Contains("Skill");
+                bool inFloor = path.Contains("Floor") && path.Contains("Up_") || path.Contains("CmbtUp") || path.Contains("ShopUp") || path.Contains("ExploUp");
+                bool isLargeEnough = tmp.rectTransform.rect.width > 80;
+
+                // Prefer a text named "Description" or similar
+                string goName = tmp.gameObject.name.ToLower();
+                if (goName.Contains("desc") || goName.Contains("info") || goName.Contains("tooltip"))
+                {
+                    _descriptionText = tmp;
+                    RataloricaAPPlugin.Log.LogInfo($"[AP][Desc] Found description by name: {tmp.gameObject.name}");
+                    return;
+                }
+
+                // Otherwise pick the widest TMPro that's in the upgrade screen but NOT inside a floor/upgrade
+                if (inUpgradeScreen && !inFloor && isLargeEnough)
+                {
+                    float w = tmp.rectTransform.rect.width;
+                    if (w > bestWidth)
+                    {
+                        bestWidth = w;
+                        bestCandidate = tmp;
+                    }
+                }
+            }
+
+            if (bestCandidate != null)
+            {
+                _descriptionText = bestCandidate;
+                RataloricaAPPlugin.Log.LogInfo($"[AP][Desc] Best candidate: '{bestCandidate.gameObject.name}' width={bestWidth:F0} text='{bestCandidate.text?.Substring(0, Math.Min(bestCandidate.text?.Length ?? 0, 60))}'");
+            }
+            else
+            {
+                RataloricaAPPlugin.Log.LogWarning("[AP][Desc] Could not find description text component.");
+            }
+        }
+
+        private void UpdateHoverTooltip()
+        {
+            if (cachedUpgrades == null || cachedUpgrades.Length == 0) return;
+            if (RataloricaAPPlugin.Instance == null || !RataloricaAPPlugin.Instance.authenticated) return;
+            if (RataloricaAPPlugin.Instance.scoutCache.Count == 0) return;
+
+            // Find description text if not yet found
+            if (_descriptionText == null)
+            {
+                FindDescriptionText();
+                if (_descriptionText == null) return;
+            }
+
+            // If the description text got destroyed (scene change), re-search next time
+            if (_descriptionText == null || _descriptionText.gameObject == null)
+            {
+                _descriptionText = null;
+                _descriptionSearchDone = false;
+                _isShowingAPDesc = false;
+                return;
+            }
+
+            // Find the camera for the WorldSpace canvas
+            Camera cam = null;
+            var canvas = _descriptionText.GetComponentInParent<Canvas>();
+            if (canvas != null && canvas.renderMode == RenderMode.WorldSpace)
+                cam = canvas.worldCamera ?? Camera.main;
+
+            Vector2 mousePos = Input.mousePosition;
+            Upgrade hoveredUpgrade = null;
+
+            foreach (var up in cachedUpgrades)
+            {
+                if (up == null) continue;
+                Transform iconTransform = up.transform.parent;
+                if (iconTransform == null) continue;
+                var rt = iconTransform.GetComponent<RectTransform>();
+                if (rt == null) continue;
+
+                if (RectTransformUtility.RectangleContainsScreenPoint(rt, mousePos, cam))
+                {
+                    hoveredUpgrade = up;
+                    break;
+                }
+            }
+
+            if (hoveredUpgrade != null)
+            {
+                string className = hoveredUpgrade.GetType().Name;
+                if (RataloricaAPPlugin.ClassToDisplayName.ContainsKey(className))
+                {
+                    string displayName = RataloricaAPPlugin.ClassToDisplayName[className];
+                    string nextCheck = RataloricaAPPlugin.Instance.GetNextUpgradeCheck(displayName);
+                    if (nextCheck != null && RataloricaAPPlugin.LocationIDs.ContainsKey(nextCheck))
+                    {
+                        long locId = RataloricaAPPlugin.LocationIDs[nextCheck];
+                        if (RataloricaAPPlugin.Instance.scoutCache.ContainsKey(locId))
+                        {
+                            var info = RataloricaAPPlugin.Instance.scoutCache[locId];
+
+                            // Build hint-style text:
+                            // [Hint]: PlayerName's ItemName is at Buy UpgradeName in MyName's World.
+                            string itemPlayerName = RataloricaAPPlugin.Instance.playerNames.ContainsKey(info.player)
+                                ? RataloricaAPPlugin.Instance.playerNames[info.player]
+                                : $"P{info.player}";
+                            string myName = RataloricaAPPlugin.Instance.playerNames.ContainsKey(RataloricaAPPlugin.Instance.mySlot)
+                                ? RataloricaAPPlugin.Instance.playerNames[RataloricaAPPlugin.Instance.mySlot]
+                                : "Player";
+
+                            string flagLabel = "";
+                            if ((info.flags & 1) != 0) flagLabel = " (progression)";
+                            else if ((info.flags & 2) != 0) flagLabel = " (useful)";
+                            else if ((info.flags & 4) != 0) flagLabel = " (trap)";
+
+                            string apText = $"[Hint]: {itemPlayerName}'s {info.itemName} is at {nextCheck} in {myName}'s World.{flagLabel}";
+
+                            // Save original and override
+                            if (!_isShowingAPDesc || _lastHoveredUpgrade != hoveredUpgrade)
+                            {
+                                _originalDescription = _descriptionText.text;
+                                _isShowingAPDesc = true;
+                                _lastHoveredUpgrade = hoveredUpgrade;
+                            }
+                            _descriptionText.text = apText;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Not hovering an AP upgrade — restore original description
+            if (_isShowingAPDesc)
+            {
+                _descriptionText.text = _originalDescription;
+                _isShowingAPDesc = false;
+                _lastHoveredUpgrade = null;
+            }
+        }
+
+        // ─── Upgrade unlock detection ───────────────────────────────────────
+
+        private void ScanForNewUpgrades()
+        {
+            if (RataloricaAPPlugin.Instance == null || !RataloricaAPPlugin.Instance.authenticated) return;
+
+            try
+            {
+                var upgrades = FindObjectsOfType<Upgrade>();
+                foreach (var up in upgrades)
+                {
+                    if (up == null || !up.gameObject.activeInHierarchy) continue;
+                    string className = up.GetType().Name;
+                    if (knownActiveUpgrades.Contains(className)) continue;
+
+                    knownActiveUpgrades.Add(className);
+
+                    // Look up the display name and send a check if the corresponding
+                    // upgrade purchase check hasn't been sent yet. This fires when
+                    // buying one upgrade reveals/unlocks another in the skill tree.
+                    if (RataloricaAPPlugin.ClassToDisplayName.ContainsKey(className))
+                    {
+                        string displayName = RataloricaAPPlugin.ClassToDisplayName[className];
+                        RataloricaAPPlugin.Log.LogInfo($"[AP] Detected newly available upgrade: {displayName} ({className})");
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // ─── AP item labels on upgrade icons (Unity UI) ─────────────────────
+
+        private Font _labelFont;
+        private bool _labelsDebugLogged = false;
+
+        private void UpdateUpgradeLabels()
+        {
+            if (cachedUpgrades == null || cachedUpgrades.Length == 0) return;
+            if (RataloricaAPPlugin.Instance == null || !RataloricaAPPlugin.Instance.authenticated) return;
+            if (RataloricaAPPlugin.Instance.scoutCache.Count == 0) return;
+
+            if (_labelFont == null)
+            {
+                try { _labelFont = Resources.GetBuiltinResource<Font>("Arial.ttf"); }
+                catch
+                {
+                    try { _labelFont = Font.CreateDynamicFontFromOSFont("Arial", 12); }
+                    catch { return; }
+                }
+            }
+
+            foreach (var up in cachedUpgrades)
+            {
+                if (up == null) continue;
+                string className = up.GetType().Name;
+                if (!RataloricaAPPlugin.ClassToDisplayName.ContainsKey(className)) continue;
+                string displayName = RataloricaAPPlugin.ClassToDisplayName[className];
+
+                string nextCheck = RataloricaAPPlugin.Instance.GetNextUpgradeCheck(displayName);
+                if (nextCheck == null) continue;
+                if (!RataloricaAPPlugin.LocationIDs.ContainsKey(nextCheck)) continue;
+                long locId = RataloricaAPPlugin.LocationIDs[nextCheck];
+                if (!RataloricaAPPlugin.Instance.scoutCache.ContainsKey(locId)) continue;
+
+                var info = RataloricaAPPlugin.Instance.scoutCache[locId];
+
+                // Debug: log the hierarchy and Canvas info once
+                if (!_labelsDebugLogged)
+                {
+                    var canvas = up.GetComponentInParent<Canvas>();
+                    bool hasRT = up.GetComponent<RectTransform>() != null;
+                    string hierarchy = up.gameObject.name;
+                    var t = up.transform.parent;
+                    while (t != null) { hierarchy = t.gameObject.name + "/" + hierarchy; t = t.parent; }
+                    RataloricaAPPlugin.Log.LogInfo($"[AP][Labels] DEBUG {displayName}: hierarchy={hierarchy}, hasRectTransform={hasRT}, hasCanvas={canvas != null}, canvasMode={canvas?.renderMode}");
+
+                    // Also log children
+                    string children = "";
+                    for (int c = 0; c < up.transform.childCount; c++)
+                        children += up.transform.GetChild(c).gameObject.name + ", ";
+                    RataloricaAPPlugin.Log.LogInfo($"[AP][Labels] DEBUG {displayName}: children=[{children}]");
+
+                    // Log all TMPro text in children
+                    var tmps = up.GetComponentsInChildren<TMPro.TextMeshProUGUI>(true);
+                    foreach (var tmp in tmps)
+                        RataloricaAPPlugin.Log.LogInfo($"[AP][Labels] DEBUG {displayName}: TMPro child '{tmp.gameObject.name}' text='{tmp.text}'");
+                }
+
+                // Build label text and color
+                bool isMyItem = (info.player == RataloricaAPPlugin.Instance.mySlot);
+                string labelText = info.itemName;
+                if (!isMyItem)
+                {
+                    string pName = RataloricaAPPlugin.Instance.playerNames.ContainsKey(info.player)
+                        ? RataloricaAPPlugin.Instance.playerNames[info.player]
+                        : $"P{info.player}";
+                    labelText += $" ({pName})";
+                }
+
+                // Color based on item flags: 1=progression(purple), 2=useful(blue), 4=trap(red), else white
+                Color labelColor;
+                if ((info.flags & 1) != 0) labelColor = new Color(0.7f, 0.3f, 1f);       // progression
+                else if ((info.flags & 2) != 0) labelColor = new Color(0.3f, 0.85f, 1f);  // useful
+                else if ((info.flags & 4) != 0) labelColor = new Color(1f, 0.3f, 0.3f);   // trap
+                else labelColor = new Color(1f, 0.95f, 0.7f);                              // filler
+
+                // The Upgrade script is on #UpgradeScripts (empty child).
+                // The actual visible icon is the PARENT (e.g. CmbtUp_Plus1BigDmg).
+                // We place our label on the PARENT so it renders on the icon.
+                Transform iconTransform = up.transform.parent;
+                if (iconTransform == null) continue;
+
+                // Find a TMPro template from the icon or its siblings for font
+                var templateTmp = iconTransform.GetComponentInChildren<TMPro.TextMeshProUGUI>(true);
+                // If not found on icon, search the parent (floor container)
+                if (templateTmp == null && iconTransform.parent != null)
+                    templateTmp = iconTransform.parent.GetComponentInChildren<TMPro.TextMeshProUGUI>(true);
+
+                Transform existingLabel = iconTransform.Find("AP_TMPLabel");
+                Transform existingUILabel = iconTransform.Find("AP_ItemLabel");
+
+                if (templateTmp != null)
+                {
+                    // Use TMPro (matches game's font)
+                    if (existingUILabel != null) Destroy(existingUILabel.gameObject); // remove old UI.Text
+
+                    if (existingLabel == null)
+                    {
+                        var go = new GameObject("AP_TMPLabel");
+                        go.transform.SetParent(iconTransform, false);
+
+                        var label = go.AddComponent<TMPro.TextMeshProUGUI>();
+                        label.font = templateTmp.font;
+                        label.fontMaterial = templateTmp.fontMaterial;
+                        label.text = labelText;
+                        label.fontSize = 6;
+                        label.color = labelColor;
+                        label.alignment = TMPro.TextAlignmentOptions.Center;
+                        label.overflowMode = TMPro.TextOverflowModes.Overflow;
+                        label.raycastTarget = false;
+                        label.enableWordWrapping = true;
+
+                        var rt = go.GetComponent<RectTransform>();
+                        rt.anchorMin = new Vector2(0f, 0f);
+                        rt.anchorMax = new Vector2(1f, 0.35f);
+                        rt.offsetMin = Vector2.zero;
+                        rt.offsetMax = Vector2.zero;
+
+                        if (!_labelsDebugLogged)
+                            RataloricaAPPlugin.Log.LogInfo($"[AP][Labels] Created TMPro label on {iconTransform.gameObject.name}: '{labelText}'");
+                    }
+                    else
+                    {
+                        var label = existingLabel.GetComponent<TMPro.TextMeshProUGUI>();
+                        if (label != null) { label.text = labelText; label.color = labelColor; }
+                    }
+                }
+                else
+                {
+                    // Fallback: UI.Text
+                    if (existingLabel != null) Destroy(existingLabel.gameObject);
+
+                    if (existingUILabel == null)
+                    {
+                        var go = new GameObject("AP_ItemLabel");
+                        go.transform.SetParent(iconTransform, false);
+
+                        var text = go.AddComponent<UnityEngine.UI.Text>();
+                        text.text = labelText;
+                        text.font = _labelFont;
+                        text.fontSize = 8;
+                        text.color = labelColor;
+                        text.alignment = TextAnchor.LowerCenter;
+                        text.horizontalOverflow = HorizontalWrapMode.Overflow;
+                        text.verticalOverflow = VerticalWrapMode.Overflow;
+                        text.raycastTarget = false;
+
+                        var outline = go.AddComponent<UnityEngine.UI.Outline>();
+                        outline.effectColor = Color.black;
+                        outline.effectDistance = new Vector2(1, -1);
+
+                        var rt = go.GetComponent<RectTransform>();
+                        rt.anchorMin = new Vector2(0f, 0f);
+                        rt.anchorMax = new Vector2(1f, 0.35f);
+                        rt.offsetMin = Vector2.zero;
+                        rt.offsetMax = Vector2.zero;
+
+                        if (!_labelsDebugLogged)
+                            RataloricaAPPlugin.Log.LogInfo($"[AP][Labels] Created UI.Text label on {iconTransform.gameObject.name}: '{labelText}'");
+                    }
+                    else
+                    {
+                        var text = existingUILabel.GetComponent<UnityEngine.UI.Text>();
+                        if (text != null) { text.text = labelText; text.color = labelColor; }
+                    }
+                }
+
+                // AP logo overlay on ALL scouted upgrades (top-left corner)
+                Transform existingLogo = iconTransform.Find("AP_Logo");
+                if (RataloricaAPPlugin.Instance.apLogoTexture != null)
+                {
+                    if (existingLogo == null)
+                    {
+                        var logoGo = new GameObject("AP_Logo");
+                        logoGo.transform.SetParent(iconTransform, false);
+
+                        var img = logoGo.AddComponent<UnityEngine.UI.RawImage>();
+                        img.texture = RataloricaAPPlugin.Instance.apLogoTexture;
+                        img.raycastTarget = false;
+
+                        var rt = logoGo.GetComponent<RectTransform>();
+                        rt.anchorMin = new Vector2(0f, 0.6f);
+                        rt.anchorMax = new Vector2(0.4f, 1f);
+                        rt.offsetMin = Vector2.zero;
+                        rt.offsetMax = Vector2.zero;
+                    }
+                }
+            }
+            _labelsDebugLogged = true;
         }
 
         // ─── Restore state from AP ─────────────────────────────────────────
@@ -878,20 +1510,12 @@ namespace RataloricaAP
             var flags = BindingFlags.NonPublic | BindingFlags.Instance;
             var t = typeof(ObjectivesManager);
 
-            // Number of classic objectives already completed in this AP run.
-            // Game order: Shop Sign first, then Upgrades Sign.
-            // We MUST call NextObjective() (not just set fields) so each objective's
-            // attachedObjective UnityEvent fires — those events enable gameplay systems
-            // like NPC customers asking for souls.
             int completedCount = 0;
             if (HasCheck("Reach Shop Sign")) completedCount++;
             if (HasCheck("Reach Upgrades Sign")) completedCount++;
 
             if (completedCount > 0)
             {
-                // Read the live currentObjectiveId — if the save already advanced past
-                // these objectives, calling NextObjective again throws IndexOutOfRange
-                // because guidanceObjectivesList[currentObjectiveId] is out of bounds.
                 int currentId = 0;
                 var idField = t.GetField("currentObjectiveId", flags);
                 if (idField != null)
@@ -908,9 +1532,7 @@ namespace RataloricaAP
                         try { nextObj.Invoke(objMgr, null); }
                         catch (Exception e)
                         {
-                            // Don't break — a failure on one objective shouldn't prevent
-                            // later ones from being activated.
-                            RataloricaAPPlugin.Log.LogWarning($"[AP] NextObjective call #{i + 1} failed (continuing): " + (e.InnerException?.Message ?? e.Message));
+                            RataloricaAPPlugin.Log.LogWarning($"[AP] NextObjective call #{i + 1} failed: " + (e.InnerException?.Message ?? e.Message));
                             try
                             {
                                 int cur = (int)idField.GetValue(objMgr);
@@ -919,14 +1541,8 @@ namespace RataloricaAP
                             catch { }
                         }
                     }
-                    RataloricaAPPlugin.Log.LogInfo($"[AP] Called NextObjective {callsNeeded}x (currentObjectiveId was {currentId}, target {completedCount})");
-                }
-                else
-                {
-                    RataloricaAPPlugin.Log.LogInfo($"[AP] No NextObjective calls needed (currentObjectiveId={currentId} already >= {completedCount})");
                 }
 
-                // Fallback: directly activate the sign GameObjects. Idempotent.
                 if (HasCheck("Reach Shop Sign"))
                 {
                     t.GetField("isShopSignActivated", flags)?.SetValue(objMgr, true);
@@ -949,14 +1565,28 @@ namespace RataloricaAP
 
         public void UnlockWorld(string worldName)
         {
-            if (worldName == "World1 Unlock") World1Unlocked = true;
-            if (worldName == "World2 Unlock") World2Unlocked = true;
-            if (worldName == "World3 Unlock") World3Unlocked = true;
+            if (worldName == "World 1 Unlock") World1Unlocked = true;
+            if (worldName == "World 2 Unlock") World2Unlocked = true;
+            if (worldName == "World 3 Unlock") World3Unlocked = true;
             RataloricaAPPlugin.Log.LogInfo($"[AP] {worldName} unlocked!");
 
-            // Goal condition (matches apworld set_rules): receiving World3 Unlock = victory.
-            if (worldName == "World3 Unlock")
+            // Check if goal conditions are now met
+            CheckGoalCompletion();
+        }
+
+        public void CheckGoalCompletion()
+        {
+            if (!World1Unlocked || !World2Unlocked || !World3Unlocked) return;
+
+            // Goal: all worlds unlocked + legendary kill in World 3 + 100 souls collected
+            bool killedLegendary = RataloricaAPPlugin.Instance?.IsLocationChecked("World 3 - Kill Legendary Enemy") ?? false;
+            bool collected100Souls = RataloricaAPPlugin.Instance?.IsLocationChecked("World 3 - Collect 100 Souls") ?? false;
+
+            if (killedLegendary && collected100Souls)
+            {
+                RataloricaAPPlugin.Log.LogInfo("[AP] All goal conditions met!");
                 RataloricaAPPlugin.Instance?.SendGoal();
+            }
         }
 
         public bool CanAccessWorld(WorldManager.World world)
@@ -974,8 +1604,6 @@ namespace RataloricaAP
 
         public void AddMoney(float amount)
         {
-            // Always queue. The Update loop drains it once PlayerManager is alive AND
-            // any in-flight scene reload has settled, so money survives reloads.
             PendingMoney += amount;
             RataloricaAPPlugin.Log.LogInfo($"[AP] Queued {amount} gold (total pending: {PendingMoney})");
         }
@@ -1023,14 +1651,18 @@ namespace RataloricaAP
         public void OnUpgradePurchased(Upgrade upgrade)
         {
             string typeName = upgrade.GetType().Name;
-            string locName = RataloricaAPPlugin.Instance.GetNextUpgradeCheck(typeName);
+            // Map class name to display name for AP
+            string displayName = RataloricaAPPlugin.ClassToDisplayName.ContainsKey(typeName)
+                ? RataloricaAPPlugin.ClassToDisplayName[typeName]
+                : typeName;
+
+            string locName = RataloricaAPPlugin.Instance.GetNextUpgradeCheck(displayName);
 
             if (locName != null)
             {
-                // Increment purchase count and send check
-                if (!RataloricaAPPlugin.Instance.upgradePurchaseCounts.ContainsKey(typeName))
-                    RataloricaAPPlugin.Instance.upgradePurchaseCounts[typeName] = 0;
-                RataloricaAPPlugin.Instance.upgradePurchaseCounts[typeName]++;
+                if (!RataloricaAPPlugin.Instance.upgradePurchaseCounts.ContainsKey(displayName))
+                    RataloricaAPPlugin.Instance.upgradePurchaseCounts[displayName] = 0;
+                RataloricaAPPlugin.Instance.upgradePurchaseCounts[displayName]++;
 
                 RataloricaAPPlugin.Instance.SendCheck(locName);
                 RataloricaAPPlugin.Log.LogInfo($"[AP] Upgrade purchase check sent: {locName}");
@@ -1041,88 +1673,72 @@ namespace RataloricaAP
 
         public void ShowLockedMessage(string worldName)
         {
-            RataloricaAPPlugin.Instance?.StartCoroutine(
-                ShowMessageCoroutine($"[Archipelago] {worldName} is locked!"));
-        }
-
-        private IEnumerator ShowMessageCoroutine(string message)
-        {
-            var go = new GameObject("AP_Msg");
-            DontDestroyOnLoad(go);
-            var canvas = go.AddComponent<Canvas>();
-            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
-            canvas.sortingOrder = 999;
-            go.AddComponent<UnityEngine.UI.CanvasScaler>();
-            go.AddComponent<UnityEngine.UI.GraphicRaycaster>();
-
-            var textGo = new GameObject("Text");
-            textGo.transform.SetParent(go.transform, false);
-            var text = textGo.AddComponent<TMPro.TextMeshProUGUI>();
-            text.text = message;
-            text.fontSize = 28;
-            text.color = new Color(1f, 0.3f, 0.3f, 1f);
-            text.alignment = TMPro.TextAlignmentOptions.Center;
-            var rect = textGo.GetComponent<RectTransform>();
-            rect.anchorMin = new Vector2(0, 0.85f);
-            rect.anchorMax = new Vector2(1, 1f);
-            rect.offsetMin = Vector2.zero;
-            rect.offsetMax = Vector2.zero;
-
-            yield return new WaitForSeconds(3f);
-            Destroy(go);
+            AddNotification($"[AP] {worldName} is locked!", new Color(1f, 0.3f, 0.3f));
         }
 
         // ─── Event handlers (called by patches) ────────────────────────────
 
         public void OnEnemyKilled(Enemy enemy, WorldManager.World currentWorld)
         {
-            string worldPrefix = currentWorld.ToString();
+            totalKillsTracked++;
 
-            string firstKillLoc = worldPrefix switch
+            // Kill milestones
+            if (totalKillsTracked == 10)  RataloricaAPPlugin.Instance?.SendCheck("Kill 10 Enemies");
+            if (totalKillsTracked == 25)  RataloricaAPPlugin.Instance?.SendCheck("Kill 25 Enemies");
+            if (totalKillsTracked == 50)  RataloricaAPPlugin.Instance?.SendCheck("Kill 50 Enemies");
+            if (totalKillsTracked == 100) RataloricaAPPlugin.Instance?.SendCheck("Kill 100 Enemies");
+            if (totalKillsTracked == 200) RataloricaAPPlugin.Instance?.SendCheck("Kill 200 Enemies");
+
+            // World-specific kill checks
+            string firstKillLoc = currentWorld switch
             {
-                "WORLD1" => "World1 - Kill first enemy",
-                "WORLD2" => "World2 - Kill first enemy",
-                "WORLD3" => "World3 - Kill first enemy",
+                WorldManager.World.WORLD1 => "World 1 - First Kill",
+                WorldManager.World.WORLD2 => "World 2 - First Kill",
+                WorldManager.World.WORLD3 => "World 3 - First Kill",
                 _ => null
             };
             if (firstKillLoc != null)
                 RataloricaAPPlugin.Instance?.SendCheck(firstKillLoc);
 
-            if (enemy.Rarity == Enemy.RarityTypes.UNCOMMON && worldPrefix == "WORLD1")
-                RataloricaAPPlugin.Instance?.SendCheck("World1 - Kill UNCOMMON enemy");
+            if (enemy.Rarity == Enemy.RarityTypes.UNCOMMON && currentWorld == WorldManager.World.WORLD1)
+                RataloricaAPPlugin.Instance?.SendCheck("World 1 - Kill Uncommon Enemy");
+
             if (enemy.Rarity == Enemy.RarityTypes.RARE)
             {
-                if (worldPrefix == "WORLD1") RataloricaAPPlugin.Instance?.SendCheck("World1 - Kill RARE enemy");
-                if (worldPrefix == "WORLD2") RataloricaAPPlugin.Instance?.SendCheck("World2 - Kill RARE enemy");
+                if (currentWorld == WorldManager.World.WORLD1)
+                    RataloricaAPPlugin.Instance?.SendCheck("World 1 - Kill Rare Enemy");
+                if (currentWorld == WorldManager.World.WORLD2)
+                    RataloricaAPPlugin.Instance?.SendCheck("World 2 - Kill Rare Enemy");
             }
+
             if (enemy.Rarity == Enemy.RarityTypes.LEGENDARY)
             {
-                if (worldPrefix == "WORLD2") RataloricaAPPlugin.Instance?.SendCheck("World2 - Kill LEGENDARY enemy");
-                if (worldPrefix == "WORLD3") RataloricaAPPlugin.Instance?.SendCheck("World3 - Kill LEGENDARY enemy");
+                if (currentWorld == WorldManager.World.WORLD2)
+                    RataloricaAPPlugin.Instance?.SendCheck("World 2 - Kill Legendary Enemy");
+                if (currentWorld == WorldManager.World.WORLD3)
+                {
+                    RataloricaAPPlugin.Instance?.SendCheck("World 3 - Kill Legendary Enemy");
+                    CheckGoalCompletion();
+                }
             }
         }
 
         public void OnSoulsUpdated(int total)
         {
             totalSoulsTracked = total;
-            if (total >= 1)   RataloricaAPPlugin.Instance?.SendCheck("Achievement - First Soul");
-            if (total >= 10)  RataloricaAPPlugin.Instance?.SendCheck("World1 - Collect 10 souls");
-            if (total >= 50)  RataloricaAPPlugin.Instance?.SendCheck("World2 - Collect 50 souls");
-            if (total >= 100) RataloricaAPPlugin.Instance?.SendCheck("World3 - Collect 100 souls");
+            if (total >= 1)   RataloricaAPPlugin.Instance?.SendCheck("First Soul Collected");
+            if (total >= 10)  RataloricaAPPlugin.Instance?.SendCheck("World 1 - Collect 10 Souls");
+            if (total >= 50)  RataloricaAPPlugin.Instance?.SendCheck("World 2 - Collect 50 Souls");
+            if (total >= 100)
+            {
+                RataloricaAPPlugin.Instance?.SendCheck("World 3 - Collect 100 Souls");
+                CheckGoalCompletion();
+            }
         }
     }
 
     // ─── Harmony Patches ────────────────────────────────────────────────────
 
-    // CORE PATCH: Intercept upgrade purchases
-    // - If AP is granting → allow (effect applies)
-    // - If check available → block effect, send check, player still pays gold
-    // - If check already sent → allow normal purchase
-    // Ratalorica's TransparentGame.Update sets the window as click-through whenever the
-    // mouse isn't over a collider on uiLayer. Our IMGUI Archipelago window isn't a collider,
-    // so by default clicks on it leak through to whatever's behind (browser, explorer, etc.)
-    // and steal focus. This postfix forces the window to capture clicks while the cursor is
-    // over our IMGUI rect.
     [HarmonyPatch(typeof(TransparentGame), "Update")]
     public class TransparentGameUpdatePatch
     {
@@ -1137,7 +1753,7 @@ namespace RataloricaAP
 
                 var rect = plugin.ConnectionWindowRect;
                 float mx = Input.mousePosition.x;
-                float my = Screen.height - Input.mousePosition.y; // IMGUI Y goes top-down
+                float my = Screen.height - Input.mousePosition.y;
                 if (!rect.Contains(new Vector2(mx, my))) return;
 
                 if (_setClickthrough == null)
@@ -1152,6 +1768,7 @@ namespace RataloricaAP
         }
     }
 
+    // CORE PATCH: Intercept upgrade purchases
     [HarmonyPatch(typeof(Upgrade), "BuyUpgrade")]
     public class UpgradeBuyPatch
     {
@@ -1164,9 +1781,10 @@ namespace RataloricaAP
                 if (RataloricaAPPlugin.Instance == null) return true;
 
                 string typeName = __instance.GetType().Name;
+                if (!RataloricaAPPlugin.ClassToDisplayName.ContainsKey(typeName)) return true;
+                string displayName = RataloricaAPPlugin.ClassToDisplayName[typeName];
 
-                // Check if there's a next upgrade check available
-                string nextCheck = RataloricaAPPlugin.Instance.GetNextUpgradeCheck(typeName);
+                string nextCheck = RataloricaAPPlugin.Instance.GetNextUpgradeCheck(displayName);
                 if (nextCheck == null) return true; // No more checks → normal purchase
 
                 // Block the effect, send check
@@ -1263,8 +1881,8 @@ namespace RataloricaAP
 
                 if (pointsIn >= needed)
                 {
-                    RataloricaAPPlugin.Log.LogInfo("[AP] SkillTree Floor2 unlocked!");
-                    RataloricaAPPlugin.Instance?.SendCheck("SkillTree Floor2 Unlocked");
+                    RataloricaAPPlugin.Log.LogInfo("[AP] SkillTree Floor 2 unlocked!");
+                    RataloricaAPPlugin.Instance?.SendCheck("SkillTree Floor 2 Unlocked");
                 }
             }
             catch (Exception e)
@@ -1291,8 +1909,8 @@ namespace RataloricaAP
 
                 if (pointsIn >= needed)
                 {
-                    RataloricaAPPlugin.Log.LogInfo("[AP] SkillTree Floor3 unlocked!");
-                    RataloricaAPPlugin.Instance?.SendCheck("SkillTree Floor3 Unlocked");
+                    RataloricaAPPlugin.Log.LogInfo("[AP] SkillTree Floor 3 unlocked!");
+                    RataloricaAPPlugin.Instance?.SendCheck("SkillTree Floor 3 Unlocked");
                 }
             }
             catch (Exception e)
@@ -1316,11 +1934,11 @@ namespace RataloricaAP
 
                 var souls = __instance.SoulsCollected;
                 if (souls.ContainsKey(Enemy.RarityTypes.UNCOMMON) && souls[Enemy.RarityTypes.UNCOMMON] >= 1)
-                    RataloricaAPPlugin.Instance?.SendCheck("Achievement - Uncommon Soul");
+                    RataloricaAPPlugin.Instance?.SendCheck("Uncommon Soul Collected");
                 if (souls.ContainsKey(Enemy.RarityTypes.RARE) && souls[Enemy.RarityTypes.RARE] >= 1)
-                    RataloricaAPPlugin.Instance?.SendCheck("Achievement - Rare Soul");
+                    RataloricaAPPlugin.Instance?.SendCheck("Rare Soul Collected");
                 if (souls.ContainsKey(Enemy.RarityTypes.LEGENDARY) && souls[Enemy.RarityTypes.LEGENDARY] >= 1)
-                    RataloricaAPPlugin.Instance?.SendCheck("Achievement - Legendary Soul");
+                    RataloricaAPPlugin.Instance?.SendCheck("Legendary Soul Collected");
             }
             catch (Exception e)
             {
