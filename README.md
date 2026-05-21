@@ -13,7 +13,7 @@ Installation côté jeu
   4592560
   5. Lance le jeu une première fois pour que BepInEx génère ses dossiers (BepInEx/config/, BepInEx/plugins/, etc.).
   Ferme le jeu.
-  6. Copie RataloricaAP.dll dans <game>\BepInEx\plugins\.
+  6. Décompresse le .zip du mod et copie tout son contenu (RataloricaAP.dll + le logo Archipelago pour les items) dans <game>\BepInEx\plugins\ (sans le dossier mod lui-même).
   7. Crée un raccourci direct vers Ratalorica.exe sur le bureau (clic droit → Envoyer vers → Bureau). C'est ce raccourci
    qu'il faut utiliser pour lancer le jeu — pas le bouton Steam qui empêche BepInEx de s'injecter. Garde Steam ouvert en
    arrière-plan pour que le SDK Steamworks (achievements, cloud) continue de fonctionner.
@@ -46,7 +46,7 @@ OK. (Otherwise, Windows will mark DLLs like winhttp.dll, etc., as Mark-of-the-We
 4592560
 5. Launch the game once so that BepInEx generates its folders (BepInEx/config/, BepInEx/plugins/, etc.).
 Close the game.
-6. Copy RataloricaAP.dll to <game>\BepInEx\plugins\.
+6. Extract the mod .zip and copy all its contents (RataloricaAP.dll + the Archipelago logo for items) into <game>\BepInEx\plugins\ (without the mod folder itself).
 7. Create a direct shortcut to Ratalorica.exe on the desktop (right-click → Send to → Desktop). This is the shortcut
 you must use to launch the game — not the Steam button, which prevents BepInEx from injecting itself. Keep Steam open in the
 background so that the Steamworks SDK (achievements, cloud) continues to function.
