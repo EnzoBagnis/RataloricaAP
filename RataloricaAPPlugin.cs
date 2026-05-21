@@ -6,7 +6,9 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Net.WebSockets;
+using System.Threading.Tasks;
 using System.Reflection;
 using System.Text;
 using System.Threading;
@@ -427,28 +429,81 @@ namespace RataloricaAP
         private IEnumerator ReloadSceneCoroutine()
         {
             Log.LogInfo("[AP] Reloading active scene to apply fresh save...");
-            // Re-arm restoration: the ObjectivesManager we just patched will be destroyed
-            // by the reload; the new instance must be re-restored after the scene loads.
             APStateManager.Instance?.MarkObjectivesNotYetRestored();
             yield return new WaitForSeconds(0.3f);
             var scene = SceneManager.GetActiveScene();
             SceneManager.LoadScene(scene.buildIndex);
+
+            // After reload, DataPersistenceManager.Start() runs OnSceneLoaded() which
+            // captures IDataPersistence objects available AT THAT MOMENT. Some Upgrades
+            // are instantiated later (e.g. when their menu becomes active), so we re-run
+            // OnSceneLoaded() after a short delay so their LoadData() is invoked and their
+            // currentLevel is properly restored from the swapped save.
+            yield return new WaitForSeconds(2f);
+            try
+            {
+                if (DataPersistenceManager.instance != null)
+                {
+                    DataPersistenceManager.instance.OnSceneLoaded();
+                    Log.LogInfo("[AP] Re-ran DataPersistenceManager.OnSceneLoaded() to catch late-instantiated upgrades");
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[AP] OnSceneLoaded retry failed: " + e.Message); }
         }
 
         // ─── WebSocket connection ───────────────────────────────────────────
 
         private IEnumerator WebSocketConnect()
         {
+            // Force modern TLS — on some Windows / .NET 4.7.2 setups the default protocol
+            // is too old for archipelago.gg's certificate, causing a silent handshake failure.
+            try
+            {
+                ServicePointManager.SecurityProtocol =
+                    SecurityProtocolType.Tls12 |
+                    (SecurityProtocolType)3072 /* Tls13 — value used so it compiles on older .NET targets */ |
+                    SecurityProtocolType.Tls11 |
+                    SecurityProtocolType.Tls;
+            }
+            catch (Exception e) { Log.LogWarning("[AP] SecurityProtocol setup failed: " + e.Message); }
+
             ws = new ClientWebSocket();
             string protocol = apServer.StartsWith("localhost") || apServer.StartsWith("127.0.0.1") ? "ws" : "wss";
-            var uri = new Uri(protocol + "://" + apServer);
-            var connectTask = ws.ConnectAsync(uri, CancellationToken.None);
+            Uri uri;
+            try { uri = new Uri(protocol + "://" + apServer); }
+            catch (Exception e)
+            {
+                Log.LogError($"[AP] Bad server URL '{apServer}': {e.Message}");
+                connectionStatus = "Bad server URL";
+                isConnecting = false;
+                yield break;
+            }
+            Log.LogInfo($"[AP] Connecting to {uri}");
+
+            Task connectTask;
+            try { connectTask = ws.ConnectAsync(uri, CancellationToken.None); }
+            catch (Exception e)
+            {
+                Log.LogError($"[AP] ConnectAsync threw {e.GetType().Name}: {e.Message}");
+                connectionStatus = "Connection failed: " + e.Message;
+                isConnecting = false;
+                yield break;
+            }
             yield return new WaitUntil(() => connectTask.IsCompleted);
+
+            if (connectTask.IsFaulted)
+            {
+                var ex = connectTask.Exception?.GetBaseException();
+                Log.LogError($"[AP] WebSocket connect faulted: {ex?.GetType().FullName}: {ex?.Message}");
+                connectionStatus = "Connection failed: " + (ex?.Message ?? "unknown");
+                isConnecting = false;
+                yield break;
+            }
 
             if (ws.State != WebSocketState.Open)
             {
-                Log.LogWarning("Could not connect to AP server.");
-                connectionStatus = "Connection failed";
+                Log.LogWarning($"[AP] WebSocket not open after connect. State={ws.State}");
+                connectionStatus = $"Connection failed (state={ws.State})";
                 isConnecting = false;
                 yield break;
             }
@@ -834,23 +889,55 @@ namespace RataloricaAP
 
             if (completedCount > 0)
             {
-                var nextObj = t.GetMethod("NextObjective", flags);
-                if (nextObj != null)
+                // Read the live currentObjectiveId — if the save already advanced past
+                // these objectives, calling NextObjective again throws IndexOutOfRange
+                // because guidanceObjectivesList[currentObjectiveId] is out of bounds.
+                int currentId = 0;
+                var idField = t.GetField("currentObjectiveId", flags);
+                if (idField != null)
                 {
-                    for (int i = 0; i < completedCount; i++)
+                    try { currentId = (int)idField.GetValue(objMgr); } catch { }
+                }
+                int callsNeeded = Math.Max(0, completedCount - currentId);
+
+                var nextObj = t.GetMethod("NextObjective", flags);
+                if (nextObj != null && callsNeeded > 0)
+                {
+                    for (int i = 0; i < callsNeeded; i++)
                     {
                         try { nextObj.Invoke(objMgr, null); }
                         catch (Exception e)
                         {
-                            RataloricaAPPlugin.Log.LogWarning("[AP] NextObjective call failed: " + e.Message);
-                            break;
+                            // Don't break — a failure on one objective shouldn't prevent
+                            // later ones from being activated.
+                            RataloricaAPPlugin.Log.LogWarning($"[AP] NextObjective call #{i + 1} failed (continuing): " + (e.InnerException?.Message ?? e.Message));
+                            try
+                            {
+                                int cur = (int)idField.GetValue(objMgr);
+                                idField.SetValue(objMgr, cur + 1);
+                            }
+                            catch { }
                         }
                     }
-                    RataloricaAPPlugin.Log.LogInfo($"[AP] Called NextObjective {completedCount}x to restore objective state (signs + UnityEvents)");
+                    RataloricaAPPlugin.Log.LogInfo($"[AP] Called NextObjective {callsNeeded}x (currentObjectiveId was {currentId}, target {completedCount})");
                 }
                 else
                 {
-                    RataloricaAPPlugin.Log.LogWarning("[AP] NextObjective method not found via reflection");
+                    RataloricaAPPlugin.Log.LogInfo($"[AP] No NextObjective calls needed (currentObjectiveId={currentId} already >= {completedCount})");
+                }
+
+                // Fallback: directly activate the sign GameObjects. Idempotent.
+                if (HasCheck("Reach Shop Sign"))
+                {
+                    t.GetField("isShopSignActivated", flags)?.SetValue(objMgr, true);
+                    var shopSign = t.GetField("shopSign", flags)?.GetValue(objMgr) as GameObject;
+                    shopSign?.SetActive(true);
+                }
+                if (HasCheck("Reach Upgrades Sign"))
+                {
+                    t.GetField("isUpgradesSignActivated", flags)?.SetValue(objMgr, true);
+                    var upgradeSign = t.GetField("upgradeSign", flags)?.GetValue(objMgr) as GameObject;
+                    upgradeSign?.SetActive(true);
                 }
             }
 
