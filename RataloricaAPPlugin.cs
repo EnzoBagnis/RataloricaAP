@@ -11,6 +11,7 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using Newtonsoft.Json;
 
 namespace RataloricaAP
@@ -45,6 +46,13 @@ namespace RataloricaAP
         internal bool connected = false;
         internal bool authenticated = false;
         private long currentIndex = 0;
+
+        // Set in CheckAndResetForNewRun, consumed after Connected packet
+        private bool needsSceneReloadAfterConnect = false;
+        // Same session: save already has the items; don't re-apply the initial dump
+        private bool skipInitialItemDump = false;
+        // Stable identifier for the AP room — captured from RoomInfo
+        private string roomSeedName = null;
 
         private HashSet<long> checkedLocations = new HashSet<long>();
         // All location IDs in the current room (checked + missing)
@@ -166,6 +174,10 @@ namespace RataloricaAP
         private Rect windowRect;
         private bool windowRectInitialized = false;
 
+        // Used by the TransparentGame.Update patch to know whether to suppress click-through.
+        public bool IsConnectionUIVisible => showConnectionUI;
+        public Rect ConnectionWindowRect => windowRect;
+
         private void OnGUI()
         {
             if (showConnectionUI)
@@ -215,11 +227,49 @@ namespace RataloricaAP
                 DoConnect();
             GUI.enabled = true;
 
+            GUI.enabled = authenticated || connected;
+            if (GUILayout.Button("Disconnect"))
+                DoDisconnect();
+            GUI.enabled = true;
+
             Color statusColor = authenticated ? Color.green : (isConnecting ? Color.yellow : Color.red);
             GUILayout.Label(connectionStatus, new GUIStyle(GUI.skin.label) { normal = { textColor = statusColor } });
 
-            // Make window draggable
-            GUI.DragWindow();
+            // Drag only from the title bar so clicks inside the window don't trigger drags
+            // and don't leak through to the game underneath.
+            GUI.DragWindow(new Rect(0, 0, 10000, 20));
+        }
+
+        private void DoDisconnect()
+        {
+            // Save before tearing down so the stash on the next Connect reflects this run.
+            try
+            {
+                if (DataPersistenceManager.instance != null)
+                {
+                    DataPersistenceManager.instance.SaveGame();
+                    Log.LogInfo("[AP] Forced SaveGame() on disconnect");
+                }
+            }
+            catch (Exception e) { Log.LogWarning("[AP] SaveGame on disconnect failed: " + e.Message); }
+
+            // Persist currentIndex so we don't re-grant items on next connect to this session.
+            PersistCurrentIndex();
+
+            try
+            {
+                if (ws != null && ws.State == WebSocketState.Open)
+                    ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "user disconnect", CancellationToken.None);
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[AP] Error closing WebSocket: " + e.Message);
+            }
+            connected = false;
+            authenticated = false;
+            connectionStatus = "Disconnected";
+            isConnecting = false;
+            Log.LogInfo("[AP] Disconnected by user.");
         }
 
         private void DrawStatusBar()
@@ -239,7 +289,8 @@ namespace RataloricaAP
             cfgSlotName.Value = apSlotName;
             cfgPassword.Value = apPassword;
 
-            CheckAndResetForNewRun();
+            // Save reset is deferred to after we have seed_name (RoomInfo) and a confirmed
+            // Connected response. Otherwise port changes would wipe the save spuriously.
             isConnecting = true;
             connectionStatus = "Connecting...";
             StartCoroutine(WebSocketConnect());
@@ -247,38 +298,141 @@ namespace RataloricaAP
 
         // ─── Save management ────────────────────────────────────────────────
 
+        private static string SessionId(string session)
+        {
+            var sb = new StringBuilder();
+            foreach (var c in session)
+                sb.Append(char.IsLetterOrDigit(c) || c == '_' || c == '-' ? c : '_');
+            return sb.ToString();
+        }
+
         private void CheckAndResetForNewRun()
         {
             string saveDir = Application.persistentDataPath;
             string sessionPath = Path.Combine(saveDir, "ap_session.txt");
             string savePath = Path.Combine(saveDir, "savedata");
             string bakPath = Path.Combine(saveDir, "savedata.bak");
-            string backupPath = Path.Combine(saveDir, "savedata.ap_backup");
 
-            string currentSession = $"{apServer}|{apSlotName}";
+            string currentSession = $"{roomSeedName}|{apSlotName}";
             string lastSession = File.Exists(sessionPath) ? File.ReadAllText(sessionPath).Trim() : null;
 
             Log.LogInfo($"[AP] Current session: {currentSession}");
             Log.LogInfo($"[AP] Last session: {lastSession ?? "(none)"}");
 
+            string currentIndexPath = Path.Combine(saveDir, $"ap_index_{SessionId(currentSession)}.txt");
+
             if (lastSession == currentSession)
             {
                 Log.LogInfo("[AP] Same AP run — keeping save.");
+                // If the plugin restarted since last play, currentIndex is back to 0 in memory
+                // but the save already has all those items applied. Restore the persisted
+                // index so HandleReceivedItems skips items <= currentIndex naturally.
+                if (currentIndex == 0 && File.Exists(currentIndexPath)
+                    && long.TryParse(File.ReadAllText(currentIndexPath).Trim(), out long restoredIdx))
+                {
+                    currentIndex = restoredIdx;
+                    Log.LogInfo($"[AP] Restored currentIndex={currentIndex} from {currentIndexPath}");
+                }
+                skipInitialItemDump = false;
+                needsSceneReloadAfterConnect = false;
                 return;
             }
 
-            Log.LogInfo("[AP] New AP run detected! Resetting save...");
-            if (File.Exists(savePath))
+            Log.LogInfo("[AP] Switching AP session — swapping per-session save files...");
+
+            // Force a save first so what we're about to stash is the live game state.
+            // The game only auto-saves every 60s, so without this we'd stash a stale file.
+            try
             {
-                File.Copy(savePath, backupPath, true);
-                File.Delete(savePath);
-                Log.LogInfo("[AP] Save file deleted (backup at savedata.ap_backup).");
+                if (DataPersistenceManager.instance != null)
+                {
+                    DataPersistenceManager.instance.SaveGame();
+                    Log.LogInfo("[AP] Forced SaveGame() before stash");
+                }
             }
-            if (File.Exists(bakPath))
-                File.Delete(bakPath);
+            catch (Exception e) { Log.LogWarning("[AP] SaveGame before swap failed: " + e.Message); }
+
+            // Persist the OLD session's currentIndex so we don't re-grant its items on return.
+            if (!string.IsNullOrEmpty(lastSession))
+            {
+                string oldIndexPath = Path.Combine(saveDir, $"ap_index_{SessionId(lastSession)}.txt");
+                try
+                {
+                    File.WriteAllText(oldIndexPath, currentIndex.ToString());
+                    Log.LogInfo($"[AP] Saved old session currentIndex={currentIndex} -> {Path.GetFileName(oldIndexPath)}");
+                }
+                catch (Exception e) { Log.LogWarning("[AP] Persist index failed: " + e.Message); }
+            }
+
+            // Backup the current save under the OLD session id, so we can restore it
+            // if the user comes back to that run later.
+            if (File.Exists(savePath) && !string.IsNullOrEmpty(lastSession))
+            {
+                string oldSessionSavePath = Path.Combine(saveDir, $"ap_save_{SessionId(lastSession)}.bak");
+                File.Copy(savePath, oldSessionSavePath, true);
+                Log.LogInfo($"[AP] Stashed old session save -> ap_save_{SessionId(lastSession)}.bak");
+            }
+
+            // Restore the NEW session's save if we have one, otherwise start fresh.
+            string newSessionSavePath = Path.Combine(saveDir, $"ap_save_{SessionId(currentSession)}.bak");
+            if (File.Exists(newSessionSavePath))
+            {
+                File.Copy(newSessionSavePath, savePath, true);
+                Log.LogInfo($"[AP] Restored save from ap_save_{SessionId(currentSession)}.bak");
+            }
+            else
+            {
+                if (File.Exists(savePath))
+                {
+                    File.Delete(savePath);
+                    Log.LogInfo("[AP] No prior save for this session — starting fresh.");
+                }
+            }
+            if (File.Exists(bakPath)) File.Delete(bakPath);
 
             File.WriteAllText(sessionPath, currentSession);
-            Log.LogInfo("[AP] Session info saved. Fresh run!");
+
+            // Reset runtime state so items re-apply cleanly to the swapped/fresh save
+            checkedLocations.Clear();
+            roomLocationIds.Clear();
+            upgradePurchaseCounts.Clear();
+            currentIndex = 0;
+            APStateManager.Instance?.ResetRuntimeState();
+
+            // Load the NEW session's persisted index if it has one (so we don't re-grant
+            // its already-applied items on return).
+            if (File.Exists(currentIndexPath)
+                && long.TryParse(File.ReadAllText(currentIndexPath).Trim(), out long newIdx))
+            {
+                currentIndex = newIdx;
+                Log.LogInfo($"[AP] Loaded currentIndex={currentIndex} for new session");
+            }
+
+            skipInitialItemDump = false;
+            needsSceneReloadAfterConnect = true;
+        }
+
+        private void PersistCurrentIndex()
+        {
+            if (string.IsNullOrEmpty(roomSeedName) || string.IsNullOrEmpty(apSlotName)) return;
+            try
+            {
+                string saveDir = Application.persistentDataPath;
+                string sid = SessionId($"{roomSeedName}|{apSlotName}");
+                File.WriteAllText(Path.Combine(saveDir, $"ap_index_{sid}.txt"), currentIndex.ToString());
+            }
+            catch (Exception e) { Log.LogWarning("[AP] Persist index failed: " + e.Message); }
+        }
+
+        private IEnumerator ReloadSceneCoroutine()
+        {
+            Log.LogInfo("[AP] Reloading active scene to apply fresh save...");
+            // Re-arm restoration: the ObjectivesManager we just patched will be destroyed
+            // by the reload; the new instance must be re-restored after the scene loads.
+            APStateManager.Instance?.MarkObjectivesNotYetRestored();
+            yield return new WaitForSeconds(0.3f);
+            var scene = SceneManager.GetActiveScene();
+            SceneManager.LoadScene(scene.buildIndex);
         }
 
         // ─── WebSocket connection ───────────────────────────────────────────
@@ -340,6 +494,11 @@ namespace RataloricaAP
                     switch (cmd)
                     {
                         case "RoomInfo":
+                            if (packet.ContainsKey("seed_name"))
+                            {
+                                roomSeedName = packet["seed_name"].ToString();
+                                Log.LogInfo($"[AP] Room seed: {roomSeedName}");
+                            }
                             SendConnectPacket();
                             break;
                         case "Connected":
@@ -347,6 +506,11 @@ namespace RataloricaAP
                             connectionStatus = $"Connected as {apSlotName}";
                             showConnectionUI = false;
                             Log.LogInfo("Authenticated with AP server!");
+
+                            // Now that we have a confirmed identity (seed_name + slot), decide
+                            // whether to reset the save. Done here (not in DoConnect) so a
+                            // failed auth never wipes the save.
+                            CheckAndResetForNewRun();
 
                             // Build the set of all location IDs in this room
                             roomLocationIds.Clear();
@@ -369,6 +533,12 @@ namespace RataloricaAP
                                 Log.LogInfo($"[AP] Missing {missing.Count} locations. Total room locations: {roomLocationIds.Count}");
                             }
                             APStateManager.Instance?.RestoreFromCheckedLocations(checkedLocations);
+
+                            if (needsSceneReloadAfterConnect)
+                            {
+                                needsSceneReloadAfterConnect = false;
+                                StartCoroutine(ReloadSceneCoroutine());
+                            }
                             break;
                         case "ReceivedItems":
                             HandleReceivedItems(packet);
@@ -408,18 +578,38 @@ namespace RataloricaAP
             var items = JsonConvert.DeserializeObject<List<Dictionary<string, object>>>(packet["items"].ToString());
             Log.LogInfo($"[AP] ReceivedItems: index={index}, count={items.Count}, currentIndex={currentIndex}");
 
+            // Same session reconnect — save already has these items; skip the initial dump
+            if (skipInitialItemDump && index == 0)
+            {
+                skipInitialItemDump = false;
+                currentIndex = items.Count;
+                Log.LogInfo($"[AP] Same session — skipping {items.Count} initial items already applied in save. currentIndex={currentIndex}");
+                return;
+            }
+            skipInitialItemDump = false;
+
             for (int i = 0; i < items.Count; i++)
             {
-                if (index + i < currentIndex) continue;
-                currentIndex = index + i + 1;
-
                 long itemId = Convert.ToInt64(items[i]["item"]);
                 string itemName = GetItemName(itemId);
+
+                // World unlocks live in memory only (APStateManager flags), not in the
+                // game's save. Re-apply them every reconnect so access state and goal
+                // status are correct, even when their original index was already skipped.
+                bool isWorldUnlock = itemName == "World1 Unlock"
+                                   || itemName == "World2 Unlock"
+                                   || itemName == "World3 Unlock";
+                bool alreadyApplied = index + i < currentIndex;
+
+                if (alreadyApplied && !isWorldUnlock) continue;
+                if (!alreadyApplied) currentIndex = index + i + 1;
+
                 Log.LogInfo($"[AP] Item #{index + i}: {itemName ?? "unknown"} (id={itemId})");
                 if (itemName != null)
                     GrantItem(itemName);
             }
             Log.LogInfo($"[AP] Done processing items. currentIndex={currentIndex}");
+            PersistCurrentIndex();
         }
 
         private string GetItemName(long id)
@@ -546,6 +736,9 @@ namespace RataloricaAP
         public bool World3Unlocked = false;
 
         public List<string> PendingUpgrades = new List<string>();
+        // Money received from AP that couldn't be applied yet (PlayerManager missing or
+        // about to be destroyed by a scene reload). Drained once PlayerManager is alive.
+        public float PendingMoney = 0f;
 
         // Flag: true when AP is granting an upgrade (allow BuyUpgrade to go through)
         internal bool isGrantingUpgrade = false;
@@ -563,6 +756,23 @@ namespace RataloricaAP
             DontDestroyOnLoad(gameObject);
         }
 
+        public void ResetRuntimeState()
+        {
+            World1Unlocked = false;
+            World2Unlocked = false;
+            World3Unlocked = false;
+            PendingUpgrades.Clear();
+            PendingMoney = 0f;
+            pendingCheckedLocations = null;
+            objectivesRestored = false;
+            totalSoulsTracked = 0;
+        }
+
+        public void MarkObjectivesNotYetRestored()
+        {
+            objectivesRestored = false;
+        }
+
         private void Update()
         {
             retryTimer += Time.deltaTime;
@@ -571,6 +781,14 @@ namespace RataloricaAP
 
             if (PendingUpgrades.Count > 0)
                 ApplyPendingUpgrades();
+
+            if (PendingMoney != 0f && PlayerManager.Instance != null)
+            {
+                float toApply = PendingMoney;
+                PendingMoney = 0f;
+                PlayerManager.Instance.ModifyMoney(toApply);
+                RataloricaAPPlugin.Log.LogInfo($"[AP] Applied {toApply} pending gold");
+            }
 
             if (pendingCheckedLocations != null && !objectivesRestored)
                 TryRestoreObjectives();
@@ -603,39 +821,37 @@ namespace RataloricaAP
             }
 
             var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+            var t = typeof(ObjectivesManager);
 
-            if (HasCheck("Reach Shop Sign"))
-            {
-                var field = typeof(ObjectivesManager).GetField("isShopSignActivated", flags);
-                if (field != null)
-                {
-                    field.SetValue(objMgr, true);
-                    RataloricaAPPlugin.Log.LogInfo("[AP] Restored: Shop Sign activated");
-                }
-            }
-            if (HasCheck("Reach Upgrades Sign"))
-            {
-                var field = typeof(ObjectivesManager).GetField("isUpgradesSignActivated", flags);
-                if (field != null)
-                {
-                    field.SetValue(objMgr, true);
-                    RataloricaAPPlugin.Log.LogInfo("[AP] Restored: Upgrades Sign activated");
-                }
-            }
+            // Number of classic objectives already completed in this AP run.
+            // Game order: Shop Sign first, then Upgrades Sign.
+            // We MUST call NextObjective() (not just set fields) so each objective's
+            // attachedObjective UnityEvent fires — those events enable gameplay systems
+            // like NPC customers asking for souls.
+            int completedCount = 0;
+            if (HasCheck("Reach Shop Sign")) completedCount++;
+            if (HasCheck("Reach Upgrades Sign")) completedCount++;
 
-            try
+            if (completedCount > 0)
             {
-                var nextObj = typeof(ObjectivesManager).GetMethod("NextObjective",
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var nextObj = t.GetMethod("NextObjective", flags);
                 if (nextObj != null)
                 {
-                    nextObj.Invoke(objMgr, null);
-                    RataloricaAPPlugin.Log.LogInfo("[AP] Called NextObjective to advance past completed objectives");
+                    for (int i = 0; i < completedCount; i++)
+                    {
+                        try { nextObj.Invoke(objMgr, null); }
+                        catch (Exception e)
+                        {
+                            RataloricaAPPlugin.Log.LogWarning("[AP] NextObjective call failed: " + e.Message);
+                            break;
+                        }
+                    }
+                    RataloricaAPPlugin.Log.LogInfo($"[AP] Called NextObjective {completedCount}x to restore objective state (signs + UnityEvents)");
                 }
-            }
-            catch (Exception e)
-            {
-                RataloricaAPPlugin.Log.LogWarning("[AP] NextObjective call failed: " + e.Message);
+                else
+                {
+                    RataloricaAPPlugin.Log.LogWarning("[AP] NextObjective method not found via reflection");
+                }
             }
 
             objectivesRestored = true;
@@ -650,6 +866,10 @@ namespace RataloricaAP
             if (worldName == "World2 Unlock") World2Unlocked = true;
             if (worldName == "World3 Unlock") World3Unlocked = true;
             RataloricaAPPlugin.Log.LogInfo($"[AP] {worldName} unlocked!");
+
+            // Goal condition (matches apworld set_rules): receiving World3 Unlock = victory.
+            if (worldName == "World3 Unlock")
+                RataloricaAPPlugin.Instance?.SendGoal();
         }
 
         public bool CanAccessWorld(WorldManager.World world)
@@ -667,10 +887,10 @@ namespace RataloricaAP
 
         public void AddMoney(float amount)
         {
-            if (PlayerManager.Instance != null)
-                PlayerManager.Instance.ModifyMoney(amount);
-            else
-                RataloricaAPPlugin.Log.LogWarning("[AP] PlayerManager not ready, cannot add money.");
+            // Always queue. The Update loop drains it once PlayerManager is alive AND
+            // any in-flight scene reload has settled, so money survives reloads.
+            PendingMoney += amount;
+            RataloricaAPPlugin.Log.LogInfo($"[AP] Queued {amount} gold (total pending: {PendingMoney})");
         }
 
         public void AddSouls(int amount)
@@ -811,6 +1031,40 @@ namespace RataloricaAP
     // - If AP is granting → allow (effect applies)
     // - If check available → block effect, send check, player still pays gold
     // - If check already sent → allow normal purchase
+    // Ratalorica's TransparentGame.Update sets the window as click-through whenever the
+    // mouse isn't over a collider on uiLayer. Our IMGUI Archipelago window isn't a collider,
+    // so by default clicks on it leak through to whatever's behind (browser, explorer, etc.)
+    // and steal focus. This postfix forces the window to capture clicks while the cursor is
+    // over our IMGUI rect.
+    [HarmonyPatch(typeof(TransparentGame), "Update")]
+    public class TransparentGameUpdatePatch
+    {
+        private static MethodInfo _setClickthrough;
+
+        static void Postfix(TransparentGame __instance)
+        {
+            try
+            {
+                var plugin = RataloricaAPPlugin.Instance;
+                if (plugin == null || !plugin.IsConnectionUIVisible) return;
+
+                var rect = plugin.ConnectionWindowRect;
+                float mx = Input.mousePosition.x;
+                float my = Screen.height - Input.mousePosition.y; // IMGUI Y goes top-down
+                if (!rect.Contains(new Vector2(mx, my))) return;
+
+                if (_setClickthrough == null)
+                    _setClickthrough = typeof(TransparentGame).GetMethod("SetClickthrough",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                _setClickthrough?.Invoke(__instance, new object[] { false });
+            }
+            catch (Exception e)
+            {
+                RataloricaAPPlugin.Log.LogError("TransparentGameUpdatePatch error: " + e.Message);
+            }
+        }
+    }
+
     [HarmonyPatch(typeof(Upgrade), "BuyUpgrade")]
     public class UpgradeBuyPatch
     {
