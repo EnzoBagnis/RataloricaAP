@@ -1824,6 +1824,7 @@ namespace RataloricaAP
             try
             {
                 if (APStateManager.Instance == null) return;
+                RataloricaAPPlugin.Log.LogInfo($"[AP] Portal entered -> {_worldToSwitchTo}");
                 if (!APStateManager.Instance.CanAccessWorld(_worldToSwitchTo))
                 {
                     string worldName = _worldToSwitchTo.ToString();
